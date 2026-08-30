@@ -1,4 +1,5 @@
-// Anecho — API contract v0.
+// Anecho — API contract v0 (v0.1: devices, sessions, levels; v0.2: generator, RTA, scope,
+// one-shot distortion measurements — additive).
 //
 // Transport: WebSocket. Control messages and events use the protobuf `Envelope` below
 // (WebSocket binary messages). Real-time streams (level meters, raw audio, ...) travel as
@@ -33,6 +34,9 @@ message Envelope {
     StartStreamResponse stream_started = 31;
     StopStreamRequest stop_stream = 32;
     StopStreamResponse stream_stopped = 33;
+
+    MeasureRequest measure = 40;        // v0.2: one-shot measurements (THD, IMD...)
+    MeasureResponse measurement = 41;
 
     Error error = 90;
     Event event = 91;
@@ -98,6 +102,9 @@ message DeviceConfig {
   optional uint32 output_range = 3;  // index into DeviceInfo.output_ranges
   repeated uint32 input_channels = 4;   // physical channels to capture; empty = all
   repeated uint32 output_channels = 5;  // physical channels to drive; empty = all
+  // v0.2: let the backend pick the input range from the signal (devices with ranges).
+  // Range changes are announced with Event.RangeChanged.
+  optional bool auto_range_input = 6;
 }
 
 message OpenSessionRequest {
@@ -129,6 +136,12 @@ enum StreamKind {
   // Raw captured audio: per channel `block_frames` samples in dBFS (±1.0 full scale).
   // values_per_channel = block_frames.
   STREAM_KIND_RAW_INPUT = 2;
+  // v0.2 — Real-time spectrum, ready to plot: one level per axis point (dBFS or dBV,
+  // Scale applied), axis = StartStreamResponse.axis_hz. values_per_channel = points.
+  STREAM_KIND_RTA = 3;
+  // v0.2 — Oscilloscope: a decimated waveform window in dBFS-scaled samples (±1.0);
+  // time axis = StartStreamResponse.axis_seconds. values_per_channel = points.
+  STREAM_KIND_SCOPE = 4;
 }
 
 // Unit of a stream. LEVELS values arrive already converted; RAW_INPUT samples are always
@@ -156,14 +169,104 @@ message BinaryFrame {
   repeated float values = 6;
 }
 
-// A generated test signal (phase 0: sine only; later phases add the full generator).
+// A generated test signal driving the outputs while streaming or measuring.
+//
+// Levels: `Sine.amplitude_dbfs` (v0.1) is the peak level in dBFS. v0.2 adds `level`,
+// which when present overrides it and applies to every signal: peak dBFS, or dBV RMS on
+// factory-calibrated devices (the backend picks the output range and the digital level).
 message Generator {
   oneof signal {
     Sine sine = 1;
+    DualTone dual_tone = 2;       // v0.2
+    Multitone multitone = 3;      // v0.2
+    Noise noise = 4;              // v0.2
+    Square square = 5;            // v0.2
   }
+  optional Level level = 10;      // v0.2
+  // Channels to drive; empty = every output channel of the session.
+  repeated uint32 output_channels = 11;  // v0.2
+
   message Sine {
     float frequency_hz = 1;
     float amplitude_dbfs = 2;   // peak amplitude, 0 dBFS = full scale
+  }
+  message DualTone {
+    float f1_hz = 1;            // e.g. 60 Hz (SMPTE), 19 kHz (CCIF)
+    float f2_hz = 2;            // e.g. 7 kHz (SMPTE), 20 kHz (CCIF)
+    float ratio_db = 3;         // level of f1 relative to f2; SMPTE 4:1 = +12.04 dB, CCIF 0
+  }
+  message Multitone {
+    repeated float frequencies_hz = 1;
+    bool schroeder_phases = 2;  // minimise crest factor
+  }
+  message Noise {
+    NoiseKind kind = 1;
+    // Periodic noise repeats one buffer of `period_frames` (FFT-exact); 0 = continuous.
+    uint32 period_frames = 2;
+    uint32 seed = 3;            // 0 = backend default; deterministic otherwise
+  }
+  enum NoiseKind {
+    NOISE_KIND_UNSPECIFIED = 0;
+    NOISE_KIND_WHITE = 1;
+    NOISE_KIND_PINK = 2;
+  }
+  message Square {
+    float frequency_hz = 1;
+  }
+  message Level {
+    oneof unit {
+      float peak_dbfs = 1;      // peak, 0 dBFS = full scale of the output range
+      float dbv_rms = 2;        // RMS in dBV; needs a factory-calibrated device
+    }
+  }
+}
+
+// v0.2 — RTA configuration.
+message RtaConfig {
+  uint32 fft_length = 1;        // power of two; 0 = default (16384)
+  Window window = 2;
+  Averaging averaging = 3;
+  // Display axis: logarithmic points between min_hz and max_hz (points = 0 -> default
+  // 1000), or fractional-octave bands (octave_fraction > 0: 1 = 1/1, 3 = 1/3, ...).
+  float min_hz = 4;
+  float max_hz = 5;
+  uint32 points = 6;
+  uint32 octave_fraction = 7;
+  float update_rate_hz = 8;     // 0 = one frame per FFT
+  enum Window {
+    WINDOW_UNSPECIFIED = 0;     // backend default (Hann)
+    WINDOW_RECTANGULAR = 1;
+    WINDOW_HANN = 2;
+    WINDOW_BLACKMAN_HARRIS_4 = 3;
+    WINDOW_BLACKMAN_HARRIS_7 = 4;
+    WINDOW_FLAT_TOP = 5;
+  }
+  message Averaging {
+    Mode mode = 1;
+    uint32 count = 2;           // exponential / linear length; 0 = default
+    enum Mode {
+      MODE_UNSPECIFIED = 0;     // none
+      MODE_EXPONENTIAL = 1;
+      MODE_LINEAR = 2;
+      MODE_PEAK_HOLD = 3;
+    }
+  }
+}
+
+// v0.2 — Scope configuration.
+message ScopeConfig {
+  uint32 window_frames = 1;     // captured window; 0 = default (block size)
+  uint32 points = 2;            // decimated points sent per frame; 0 = window_frames
+  Trigger trigger = 3;
+  message Trigger {
+    Mode mode = 1;
+    float level = 2;            // ±1.0 full scale
+    uint32 channel = 3;
+    enum Mode {
+      MODE_UNSPECIFIED = 0;     // free running
+      MODE_RISING = 1;
+      MODE_FALLING = 2;
+    }
   }
 }
 
@@ -173,6 +276,8 @@ message StartStreamRequest {
   uint32 block_frames = 3;       // capture block size; 0 = backend default
   float levels_rate_hz = 4;      // LEVELS only; 0 = default (20 Hz)
   optional Generator generator = 5;  // drive the outputs while streaming
+  optional RtaConfig rta = 6;        // v0.2, RTA only
+  optional ScopeConfig scope = 7;    // v0.2, SCOPE only
 }
 
 message StartStreamResponse {
@@ -182,6 +287,59 @@ message StartStreamResponse {
   uint32 sample_rate = 4;
   Scale scale = 5;
   uint32 values_per_channel = 6;
+  // v0.2 — axes sent once: frequency of each RTA point (Hz), time of each SCOPE point
+  // (seconds from the window start). Clients plot values against these, nothing else.
+  repeated float axis_hz = 7;
+  repeated float axis_seconds = 8;
+}
+
+// ---------------------------------------------------------------------------------------
+// v0.2 — One-shot measurements (scriptable: request, wait, typed result)
+// ---------------------------------------------------------------------------------------
+
+enum MeasureKind {
+  MEASURE_KIND_UNSPECIFIED = 0;
+  MEASURE_KIND_THD = 1;         // THD and THD+N on a sine (generator required or external)
+  MEASURE_KIND_IMD_SMPTE = 2;   // 60 Hz + 7 kHz, 4:1 (or the DualTone provided)
+  MEASURE_KIND_IMD_CCIF = 3;    // 19 kHz + 20 kHz, 1:1 (or the DualTone provided)
+}
+
+message MeasureRequest {
+  uint64 session_id = 1;
+  MeasureKind kind = 2;
+  optional Generator generator = 3;  // drive the outputs during the measurement
+  uint32 fft_length = 4;             // 0 = default (65536)
+  RtaConfig.Window window = 5;       // 0 = default (Blackman-Harris 7)
+  uint32 averages = 6;               // captures to average; 0 = default (4)
+  uint32 max_harmonic = 7;           // THD: highest harmonic; 0 = default (9)
+  float band_min_hz = 8;             // THD+N band; 0 = 20 Hz
+  float band_max_hz = 9;             // 0 = min(20 kHz, 0.45 fs)
+}
+
+message DistortionResult {
+  float fundamental_hz = 1;
+  float fundamental_level = 2;       // in the session's input Scale (dBFS or dBV)
+  float thd_pct = 3;
+  float thd_db = 4;
+  float thd_n_pct = 5;
+  float thd_n_db = 6;
+  repeated Harmonic harmonics = 7;
+  float noise_floor_db = 8;          // relative to the fundamental
+  float imd_pct = 9;                 // IMD kinds only
+  float imd_db = 10;
+  message Harmonic {
+    uint32 order = 1;
+    float frequency_hz = 2;
+    float level_db_rel = 3;          // relative to the fundamental
+  }
+}
+
+message MeasureResponse {
+  MeasureKind kind = 1;
+  uint32 channel = 2;                // one response per measured channel...
+  repeated DistortionResult per_channel = 3;  // ...or all channels here (channel index order)
+  uint32 sample_rate = 4;
+  Scale scale = 5;
 }
 
 message StopStreamRequest {
@@ -214,8 +372,14 @@ message Event {
     DeviceListChanged device_list_changed = 1;
     DeviceLost device_lost = 2;
     StreamOverrun stream_overrun = 3;
+    RangeChanged range_changed = 4;   // v0.2
   }
   message DeviceListChanged {}
+  message RangeChanged {
+    uint64 session_id = 1;
+    optional uint32 input_range = 2;   // new index into DeviceInfo.input_ranges
+    optional uint32 output_range = 3;
+  }
   message DeviceLost {
     uint64 session_id = 1;
     string device_id = 2;
