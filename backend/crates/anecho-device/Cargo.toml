@@ -68,3 +68,7 @@ required-features = ["qa40x"]
 [[example]]
 name = "qa40x_residual"
 required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_channel_check"
+required-features = ["qa40x"]
