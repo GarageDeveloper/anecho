@@ -6,6 +6,7 @@ use anecho_device::DeviceRegistry;
 use anecho_device::backends::virtual_loopback::{LoopbackOptions, VirtualLoopbackBackend};
 use anecho_engine::Engine;
 use std::sync::Arc;
+#[cfg(feature = "qa40x-sim")]
 use std::time::Duration;
 
 async fn serve(registry: DeviceRegistry) -> (String, tokio::sync::oneshot::Sender<()>) {
