@@ -1,7 +1,9 @@
 # Anecho
 
 Open source audio analyzer for acoustic measurement (rooms, loudspeakers) and
-electrical measurement (amplifiers, electronics) — a free successor to REW.
+electrical measurement (amplifiers, electronics). Inspired by REW, which it does not try
+to replace: Anecho is a much smaller tool that focuses on a scriptable engine and a
+modern UI.
 
 - **Headless Rust backend** — the whole engine (acquisition, DSP, analysis) is driven
   through an API (WebSocket + protobuf, binary Float32 frames for real-time streams).
@@ -24,7 +26,7 @@ electrical measurement (amplifiers, electronics) — a free successor to REW.
 
 ## Status
 
-Early development — not usable yet.
+Early development — not usable yet. If you need measurements today, use REW.
 
 ## License
 
