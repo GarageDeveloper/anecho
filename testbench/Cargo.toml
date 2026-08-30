@@ -1,0 +1,28 @@
+[package]
+name = "anecho-testbench"
+description = "A/B bench: drives REW (HTTP API) and Anecho (WebSocket API) on the same inputs and compares"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "anecho-testbench"
+path = "src/main.rs"
+
+[dependencies]
+anecho-client.workspace = true
+anecho-contract.workspace = true
+tokio = { workspace = true, features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "backend/crates/*",
     "drivers/*",
+    "testbench",
 ]
 # Added in later phase-0 tasks: frontend/src-tauri, testbench
 
