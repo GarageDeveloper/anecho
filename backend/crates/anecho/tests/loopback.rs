@@ -210,3 +210,96 @@ async fn session_is_released_when_client_disconnects() {
         .unwrap();
     assert!(s.session_id > 1);
 }
+
+/// Same exit criterion on the simulated QA40x: the API reports a volt scale and the level
+/// meter, converted with it, matches what the generator produced in dBV.
+#[cfg(feature = "qa40x-sim")]
+#[tokio::test]
+async fn headless_qa40x_simulator_levels_in_dbv() {
+    use anecho_device::backends::qa40x::Qa40xBackend;
+    let registry =
+        DeviceRegistry::new().with_backend(Arc::new(Qa40xBackend::empty().with_simulator(false)));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, _task) = anecho_server::serve(
+        Engine::new(registry),
+        "127.0.0.1:0".parse().unwrap(),
+        async {
+            let _ = stop_rx.await;
+        },
+    )
+    .await
+    .unwrap();
+    let _stop = stop_tx;
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let devices = client.list_devices().await.unwrap();
+    let dev = devices
+        .iter()
+        .find(|d| d.backend == pb::BackendKind::Qa40x as i32)
+        .expect("simulated QA40x");
+    assert!(dev.factory_calibrated);
+    assert!(dev.synchronous_io);
+    let in_range = dev
+        .input_ranges
+        .iter()
+        .position(|r| r.full_scale_dbv == 6.0)
+        .unwrap() as u32;
+    let out_range = dev
+        .output_ranges
+        .iter()
+        .position(|r| r.full_scale_dbv == -2.0)
+        .unwrap() as u32;
+
+    let session = client
+        .open_session(
+            &dev.id,
+            pb::DeviceConfig {
+                sample_rate: 48_000,
+                input_range: Some(in_range),
+                output_range: Some(out_range),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut frames = client.frames();
+    let stream = client
+        .start_stream(pb::StartStreamRequest {
+            session_id: session.session_id,
+            kind: pb::StreamKind::Levels as i32,
+            block_frames: 4096,
+            levels_rate_hz: 10.0,
+            generator: Some(pb::Generator {
+                signal: Some(pb::generator::Signal::Sine(pb::generator::Sine {
+                    frequency_hz: 1000.0,
+                    amplitude_dbfs: -20.0,
+                })),
+            }),
+        })
+        .await
+        .unwrap();
+    let Some(pb::scale::Unit::DbvOffset(_)) = stream.scale.and_then(|s| s.unit) else {
+        panic!("QA40x streams must be volt-scaled");
+    };
+    // -20 dBFS peak on the -2 dBV range comes back at -21.76 dBV through the simulator's
+    // factory calibration page (cross-checked by anecho-device's own loopback test at
+    // 0.01 dB). LEVELS values arrive in dBV already — nothing to convert client-side.
+    let mut readings = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while readings.len() < 6 {
+        let f = tokio::time::timeout_at(deadline, frames.recv())
+            .await
+            .expect("frames")
+            .unwrap();
+        if f.stream_id == stream.stream_id {
+            readings.push(f);
+        }
+    }
+    let rms_dbv: Vec<f32> = readings[2..].iter().map(|f| f.channel(0)[0]).collect();
+    for v in &rms_dbv {
+        assert!((v + 21.76).abs() < 1.0, "rms {v} dBV");
+    }
+    client.stop_stream(stream.stream_id).await.unwrap();
+    client.close_session(session.session_id).await.unwrap();
+}

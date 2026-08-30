@@ -6,6 +6,13 @@
 //! sample-synchronous with the stimulus, but there is a short gap (USB turnaround + lead-in)
 //! between two calls. `InputBlock::first_frame` counts captured frames only. Continuous,
 //! gap-free streaming needs the driver's lower-level pump and is a phase 1 item.
+//!
+//! Round-trip latency: the driver returns the capture window aligned on the *start of the
+//! stimulus*, so the first `L` samples of every call are the previous silence and the last
+//! `L` samples of the stimulus never come back. When generating, the adapter measures `L`
+//! once at stream start (a short burst, first sample above threshold), then pads every
+//! stimulus with `L` trailing zeros and drops the first `L` captured samples, so each block
+//! is pure, aligned stimulus response.
 
 use crate::backends::blocker::Blocker;
 use crate::{
@@ -25,6 +32,20 @@ use tokio::task::JoinHandle;
 
 /// Frames generated+captured per driver call.
 pub const CHUNK_FRAMES: usize = 8192;
+/// Chirp used to measure the round-trip latency at stream start (peak, full scale = 1).
+const LATENCY_PROBE_PEAK: f32 = 0.1;
+/// Capture window of the probe.
+const LATENCY_PROBE_FRAMES: usize = 4096;
+/// Length of the chirp itself; the rest of the window is silence for the echo to land in.
+const LATENCY_CHIRP_FRAMES: usize = 1024;
+/// Chirp band (Hz). Broadband so that the cross-correlation peak is unambiguous.
+const LATENCY_CHIRP_BAND: (f32, f32) = (200.0, 12_000.0);
+/// Below this expected captured peak (dBFS) the probe cannot be trusted.
+const LATENCY_MIN_EXPECTED_DBFS: f32 = -110.0;
+/// Upper bound on a plausible latency; beyond that the probe is considered failed.
+const LATENCY_MAX_FRAMES: usize = LATENCY_PROBE_FRAMES - LATENCY_CHIRP_FRAMES;
+/// Correlation peak must exceed the mean absolute correlation by this factor.
+const LATENCY_PEAK_TO_MEAN: f32 = 8.0;
 
 pub struct Qa40xBackend {
     sources: Vec<Arc<dyn DeviceSource>>,
@@ -163,6 +184,7 @@ impl DeviceBackend for Qa40xBackend {
             handle,
             state: Mutex::new(State::default()),
             offsets_dbv: std::sync::Mutex::new((0.0, 0.0)),
+            measured_latency: Arc::new(std::sync::Mutex::new(None)),
         }))
     }
 }
@@ -186,6 +208,8 @@ pub struct Qa40xDevice {
     state: Mutex<State>,
     /// (input, output) dBV offsets for the applied ranges; cached because `scale` is sync.
     offsets_dbv: std::sync::Mutex<(f32, f32)>,
+    /// Round-trip latency measured at the last generating stream start, in frames.
+    measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 impl std::fmt::Debug for Qa40xDevice {
@@ -297,6 +321,8 @@ impl MeasurementDevice for Qa40xDevice {
             cfg,
             source: output,
             cancel: cancel.clone(),
+            measured_latency: self.measured_latency.clone(),
+            offsets_dbv: *self.offsets_dbv.lock().unwrap(),
         };
         let task = tokio::spawn(worker.run());
         st.running = Some(Running {
@@ -336,7 +362,7 @@ impl MeasurementDevice for Qa40xDevice {
     fn latency(&self) -> LatencyInfo {
         LatencyInfo {
             reported_frames: None,
-            measured_frames: None,
+            measured_frames: self.measured_latency.lock().unwrap().map(|l| l as f64),
         }
     }
 }
@@ -348,6 +374,94 @@ struct Worker {
     source: Option<Box<dyn OutputSource>>,
     blocker: Blocker,
     cancel: Arc<AtomicBool>,
+    measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
+    offsets_dbv: (f32, f32),
+}
+
+/// Linear chirp, `LATENCY_CHIRP_FRAMES` long, zero-padded to `LATENCY_PROBE_FRAMES`.
+fn latency_chirp(sample_rate: u32) -> Vec<f32> {
+    let sr = sample_rate as f32;
+    let (f0, f1) = LATENCY_CHIRP_BAND;
+    let f1 = f1.min(sr * 0.4);
+    let dur = LATENCY_CHIRP_FRAMES as f32 / sr;
+    let k = (f1 - f0) / dur;
+    let mut v = vec![0f32; LATENCY_PROBE_FRAMES];
+    for (i, s) in v.iter_mut().enumerate().take(LATENCY_CHIRP_FRAMES) {
+        let t = i as f32 / sr;
+        let phase = std::f32::consts::TAU * (f0 * t + 0.5 * k * t * t);
+        // Hann-shaped edges avoid clicks and sharpen the correlation peak.
+        let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / LATENCY_CHIRP_FRAMES as f32).cos();
+        *s = LATENCY_PROBE_PEAK * w * phase.sin();
+    }
+    v
+}
+
+/// Lag maximising the cross-correlation of `captured` with `reference`, if the peak is
+/// clearly above the background.
+fn best_lag(reference: &[f32], captured: &[f32], max_lag: usize) -> Option<usize> {
+    let n = LATENCY_CHIRP_FRAMES.min(reference.len());
+    let mut corr = Vec::with_capacity(max_lag + 1);
+    for lag in 0..=max_lag {
+        if lag + n > captured.len() {
+            break;
+        }
+        let c: f32 = reference[..n]
+            .iter()
+            .zip(&captured[lag..lag + n])
+            .map(|(a, b)| a * b)
+            .sum();
+        corr.push(c.abs());
+    }
+    let (best, peak) = corr
+        .iter()
+        .copied()
+        .enumerate()
+        .fold((0usize, 0f32), |m, (i, c)| if c > m.1 { (i, c) } else { m });
+    let mean = corr.iter().sum::<f32>() / corr.len() as f32;
+    (peak > 0.0 && peak > LATENCY_PEAK_TO_MEAN * mean).then_some(best)
+}
+
+/// Send a short chirp on the driven channels and measure when it comes back.
+async fn probe_latency(
+    handle: &DeviceHandle,
+    cancel: &AtomicBool,
+    sample_rate: u32,
+    drive_l: bool,
+    drive_r: bool,
+    (in_off, out_off): (f32, f32),
+) -> Option<usize> {
+    // The chirp is generated on the output range and captured on the input range: its
+    // expected captured peak is the probe peak shifted by the offset difference.
+    let expected_dbfs = 20.0 * LATENCY_PROBE_PEAK.log10() + out_off - in_off;
+    if expected_dbfs < LATENCY_MIN_EXPECTED_DBFS {
+        log::warn!(
+            "latency probe skipped: expected loopback level {expected_dbfs:.1} dBFS is too low"
+        );
+        return None;
+    }
+    let chirp = latency_chirp(sample_rate);
+    let zero = vec![0f32; LATENCY_PROBE_FRAMES];
+    let dev = handle.lock().await;
+    let audio = dev
+        .generate_and_capture_cancellable(
+            if drive_l { &chirp } else { &zero },
+            if drive_r { &chirp } else { &zero },
+            Some(cancel),
+        )
+        .await
+        .ok()?;
+    drop(dev);
+    let l = drive_l
+        .then(|| best_lag(&chirp, &audio.left_channel, LATENCY_MAX_FRAMES))
+        .flatten();
+    let r = drive_r
+        .then(|| best_lag(&chirp, &audio.right_channel, LATENCY_MAX_FRAMES))
+        .flatten();
+    match (l, r) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
 }
 
 impl Worker {
@@ -357,13 +471,45 @@ impl Worker {
             .source
             .take()
             .unwrap_or_else(|| Box::new(crate::traits::Silence));
-        let mut inter = vec![0f32; CHUNK_FRAMES * 2];
-        let mut left = vec![0f32; CHUNK_FRAMES];
-        let mut right = vec![0f32; CHUNK_FRAMES];
         let drive_l = self.applied.output_channels.contains(&0);
         let drive_r = self.applied.output_channels.contains(&1);
         let cap_l = self.applied.input_channels.contains(&0);
         let cap_r = self.applied.input_channels.contains(&1);
+
+        // Latency compensation only matters when we drive the outputs.
+        let pad = if self.cfg.generate && (drive_l || drive_r) {
+            match probe_latency(
+                &self.handle,
+                &self.cancel,
+                self.applied.sample_rate,
+                drive_l,
+                drive_r,
+                self.offsets_dbv,
+            )
+            .await
+            {
+                Some(l) => {
+                    log::info!("qa40x round-trip latency: {l} frames");
+                    *self.measured_latency.lock().unwrap() = Some(l);
+                    l
+                }
+                None => {
+                    log::warn!(
+                        "qa40x latency probe found no loopback signal; blocks are not latency-aligned"
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        if self.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut inter = vec![0f32; CHUNK_FRAMES * 2];
+        let mut left = vec![0f32; CHUNK_FRAMES + pad];
+        let mut right = vec![0f32; CHUNK_FRAMES + pad];
 
         while !self.cancel.load(Ordering::Relaxed) && !self.blocker.is_closed() {
             inter.iter_mut().for_each(|s| *s = 0.0);
@@ -374,6 +520,9 @@ impl Worker {
                 left[i] = if drive_l { fr[0] } else { 0.0 };
                 right[i] = if drive_r { fr[1] } else { 0.0 };
             }
+            // Trailing zeros: the stimulus tail must have time to come back.
+            left[CHUNK_FRAMES..].iter_mut().for_each(|s| *s = 0.0);
+            right[CHUNK_FRAMES..].iter_mut().for_each(|s| *s = 0.0);
             let dev = self.handle.lock().await;
             let res = dev
                 .generate_and_capture_cancellable(&left, &right, Some(&self.cancel))
@@ -392,12 +541,49 @@ impl Worker {
                 continue;
             }
             let n = audio.left_channel.len().min(audio.right_channel.len());
-            let mut out = Vec::with_capacity(n * 2);
-            for i in 0..n {
+            let start = pad.min(n);
+            let mut out = Vec::with_capacity((n - start) * 2);
+            for i in start..n {
                 out.push(if cap_l { audio.left_channel[i] } else { 0.0 });
                 out.push(if cap_r { audio.right_channel[i] } else { 0.0 });
             }
             self.blocker.push(&out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chirp_lag_is_recovered_in_noise() {
+        let chirp = latency_chirp(48_000);
+        for lag in [0usize, 48, 1200, 2500] {
+            let mut captured = vec![0f32; LATENCY_PROBE_FRAMES];
+            let mut rng = 0x1234_5678u32;
+            for (i, s) in captured.iter_mut().enumerate() {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                let noise = (rng as f32 / u32::MAX as f32 - 0.5) * 0.02; // -40 dBFS peak
+                let echo = if i >= lag && i - lag < LATENCY_CHIRP_FRAMES {
+                    0.01 * chirp[i - lag] / LATENCY_PROBE_PEAK
+                } else {
+                    0.0
+                };
+                *s = noise + echo; // echo at -40 dBFS peak, level with the noise
+            }
+            assert_eq!(
+                best_lag(&chirp, &captured, LATENCY_MAX_FRAMES),
+                Some(lag),
+                "lag {lag}"
+            );
+        }
+        // Pure noise: no lag.
+        let noise: Vec<f32> = (0..LATENCY_PROBE_FRAMES)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5)
+            .collect();
+        assert_eq!(best_lag(&chirp, &noise, LATENCY_MAX_FRAMES), None);
     }
 }

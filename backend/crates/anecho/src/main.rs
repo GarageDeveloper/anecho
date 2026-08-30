@@ -28,6 +28,12 @@ enum Cmd {
         /// Do not expose sound cards.
         #[arg(long)]
         no_cpal: bool,
+        /// Do not expose QA40x units on the USB bus.
+        #[arg(long)]
+        no_qa40x: bool,
+        /// Also expose the embedded QA40x simulator (build feature qa40x-sim).
+        #[arg(long)]
+        qa40x_sim: bool,
     },
     /// Print backend and contract versions.
     Version {
@@ -66,10 +72,14 @@ async fn main() -> anyhow::Result<()> {
             bind,
             virtual_loopback,
             no_cpal,
+            no_qa40x,
+            qa40x_sim,
         } => {
             let engine = anecho::build_engine(&anecho::BackendOptions {
                 virtual_loopback,
                 cpal: !no_cpal,
+                qa40x: !no_qa40x,
+                qa40x_sim,
             });
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;

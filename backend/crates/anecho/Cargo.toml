@@ -9,9 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["cpal"]
+default = ["cpal", "qa40x"]
 cpal = ["anecho-device/cpal"]
 asio = ["anecho-device/asio"]
+qa40x = ["anecho-device/qa40x"]
+# Embedded QA40x simulator (hardware-free demos and tests).
+qa40x-sim = ["qa40x", "anecho-device/qa40x-sim"]
 
 [dependencies]
 anecho-contract.workspace = true

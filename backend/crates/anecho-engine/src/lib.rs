@@ -199,9 +199,17 @@ impl Engine {
                 } else {
                     req.levels_rate_hz
                 };
+                // Level frames are ready to plot: dBFS, or dBV when the device is calibrated.
+                let offset_db = match scale {
+                    Scale::Dbfs => 0.0,
+                    Scale::Volts { dbv_offset } => dbv_offset,
+                };
                 (
                     2,
-                    Processor::Levels(levels::LevelMeter::new(channels, applied.sample_rate, rate)),
+                    Processor::Levels(
+                        levels::LevelMeter::new(channels, applied.sample_rate, rate)
+                            .with_offset_db(offset_db),
+                    ),
                 )
             }
             StreamKind::RawInput => (

@@ -5,6 +5,8 @@ use anecho_device::InputBlock;
 #[derive(Debug)]
 pub struct LevelMeter {
     channels: usize,
+    /// Added to every dB value (0 for dBFS, the device's dBV offset for volts).
+    offset_db: f32,
     window_frames: usize,
     acc_sq: Vec<f64>,
     peak: Vec<f32>,
@@ -40,7 +42,14 @@ impl LevelMeter {
             peak: vec![0.0; channels as usize],
             frames_in_window: 0,
             window_first_frame: 0,
+            offset_db: 0.0,
         }
+    }
+
+    /// Report values in `dB + offset_db` (e.g. dBV) instead of plain dBFS.
+    pub fn with_offset_db(mut self, offset_db: f32) -> Self {
+        self.offset_db = offset_db;
+        self
     }
 
     pub fn window_frames(&self) -> usize {
@@ -74,8 +83,8 @@ impl LevelMeter {
         let n = self.frames_in_window as f64;
         let mut values = Vec::with_capacity(self.channels * 2);
         for c in 0..self.channels {
-            values.push(to_db((self.acc_sq[c] / n).sqrt()));
-            values.push(to_db(self.peak[c] as f64));
+            values.push(to_db((self.acc_sq[c] / n).sqrt()) + self.offset_db);
+            values.push(to_db(self.peak[c] as f64) + self.offset_db);
             self.acc_sq[c] = 0.0;
             self.peak[c] = 0.0;
         }

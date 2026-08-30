@@ -122,15 +122,17 @@ message CloseSessionResponse {}
 
 enum StreamKind {
   STREAM_KIND_UNSPECIFIED = 0;
-  // Level meter: per channel [rms, peak] in the stream's scale, decimated to
-  // `levels_rate_hz`. values_per_channel = 2.
+  // Level meter: per channel [rms, peak], decimated to `levels_rate_hz`, ready to plot:
+  // dBFS when Scale is dbfs, dBV when Scale carries a dbv_offset (already applied).
+  // values_per_channel = 2.
   STREAM_KIND_LEVELS = 1;
   // Raw captured audio: per channel `block_frames` samples in dBFS (±1.0 full scale).
   // values_per_channel = block_frames.
   STREAM_KIND_RAW_INPUT = 2;
 }
 
-// How to interpret values of a stream.
+// Unit of a stream. LEVELS values arrive already converted; RAW_INPUT samples are always
+// dBFS (±1.0 full scale) and `dbv_offset` tells how to label them in volts.
 message Scale {
   oneof unit {
     bool dbfs = 1;            // only dBFS is meaningful
