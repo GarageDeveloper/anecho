@@ -1,0 +1,22 @@
+[package]
+name = "anecho-engine"
+description = "Anecho headless engine: sessions, streams, level meters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anecho-device.workspace = true
+anecho-wire.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

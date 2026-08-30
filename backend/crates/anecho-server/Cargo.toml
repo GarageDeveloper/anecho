@@ -1,0 +1,22 @@
+[package]
+name = "anecho-server"
+description = "Anecho WebSocket API server (protobuf envelopes + binary frames)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anecho-contract.workspace = true
+anecho-device.workspace = true
+anecho-engine.workspace = true
+anecho-wire.workspace = true
+axum.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

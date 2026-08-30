@@ -11,7 +11,7 @@ pub mod v0 {
     include!(concat!(env!("OUT_DIR"), "/anecho.v0.rs"));
 }
 
-pub use prost::Message;
+pub use prost::{DecodeError, Message};
 
 #[cfg(test)]
 mod tests {

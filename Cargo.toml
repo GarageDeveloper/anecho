@@ -16,6 +16,11 @@ authors = ["Anecho contributors"]
 
 [workspace.dependencies]
 anecho-contract = { path = "backend/crates/anecho-contract" }
+anecho-device = { path = "backend/crates/anecho-device" }
+anecho-engine = { path = "backend/crates/anecho-engine" }
+anecho-wire = { path = "backend/crates/anecho-wire" }
+anecho-server = { path = "backend/crates/anecho-server" }
+anecho-client = { path = "backend/crates/anecho-client" }
 
 prost = "0.14"
 prost-build = "0.14"
@@ -27,6 +32,12 @@ anyhow = "1"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bytes = "1"
+futures-util = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.30"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

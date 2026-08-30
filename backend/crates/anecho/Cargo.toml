@@ -1,0 +1,30 @@
+[package]
+name = "anecho"
+description = "Anecho headless backend and command-line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["cpal"]
+cpal = ["anecho-device/cpal"]
+asio = ["anecho-device/asio"]
+
+[dependencies]
+anecho-contract.workspace = true
+anecho-device.workspace = true
+anecho-engine.workspace = true
+anecho-server.workspace = true
+anecho-client.workspace = true
+anecho-wire.workspace = true
+tokio = { workspace = true, features = ["full"] }
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
