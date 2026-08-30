@@ -146,6 +146,7 @@ name = "anecho-engine"
 version = "0.1.0"
 dependencies = [
  "anecho-device",
+ "anecho-dsp",
  "anecho-wire",
  "log",
  "thiserror 2.0.20",

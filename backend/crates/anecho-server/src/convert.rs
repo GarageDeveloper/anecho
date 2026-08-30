@@ -4,7 +4,8 @@ use anecho_contract::v0 as pb;
 use anecho_device::{
     AppliedConfig, BackendKind, Calibration, DeviceConfig, DeviceDescriptor, DeviceError, Scale,
 };
-use anecho_engine::{EngineError, StreamInfo, StreamKind, StreamRequest, generator::Signal};
+use anecho_engine::generator::{GenLevel, GeneratorSpec, Signal};
+use anecho_engine::{EngineError, Event, StreamInfo, StreamKind, StreamRequest};
 
 pub fn backend_kind(k: BackendKind) -> pb::BackendKind {
     match k {
@@ -48,6 +49,7 @@ pub fn device_config(c: &pb::DeviceConfig) -> Result<DeviceConfig, EngineError> 
         output_range: c.output_range.map(|x| x as usize),
         input_channels: ch(&c.input_channels)?,
         output_channels: ch(&c.output_channels)?,
+        auto_range_input: c.auto_range_input.unwrap_or(false),
     })
 }
 
@@ -68,23 +70,119 @@ pub fn stream_request(r: &pb::StartStreamRequest) -> Result<StreamRequest, Engin
         Ok(pb::StreamKind::RawInput) => StreamKind::RawInput,
         _ => return Err(EngineError::BadRequest("stream kind is required".into())),
     };
-    let generator = match &r.generator {
-        None => None,
-        Some(pb::Generator {
-            signal: Some(pb::generator::Signal::Sine(s)),
-            ..
-        }) => Some(Signal::Sine {
-            frequency_hz: s.frequency_hz,
-            amplitude_dbfs: s.amplitude_dbfs,
-        }),
-        Some(_) => return Err(EngineError::BadRequest("generator without signal".into())),
-    };
+    let generator = r.generator.as_ref().map(generator).transpose()?;
     Ok(StreamRequest {
         kind,
         block_frames: r.block_frames,
         levels_rate_hz: r.levels_rate_hz,
         generator,
     })
+}
+
+/// Contract generator → engine spec. `Sine.amplitude_dbfs` keeps its v0.1 meaning when no
+/// `level` is given; every other signal needs `level`.
+pub fn generator(g: &pb::Generator) -> Result<GeneratorSpec, EngineError> {
+    use pb::generator::Signal as S;
+    let bad = |m: &str| EngineError::BadRequest(m.to_string());
+    let (signal, sine_dbfs) = match &g.signal {
+        Some(S::Sine(s)) => (
+            Signal::Sine {
+                hz: s.frequency_hz as f64,
+            },
+            Some(s.amplitude_dbfs as f64),
+        ),
+        Some(S::DualTone(d)) => (
+            Signal::DualTone {
+                f1: d.f1_hz as f64,
+                f2: d.f2_hz as f64,
+                ratio_db: d.ratio_db as f64,
+            },
+            None,
+        ),
+        Some(S::Multitone(m)) => (
+            Signal::Multitone {
+                tones: m.frequencies_hz.iter().map(|f| (*f as f64, 0.0)).collect(),
+                schroeder: m.schroeder_phases,
+            },
+            None,
+        ),
+        Some(S::Noise(n)) => {
+            let seed = if n.seed == 0 { 1 } else { n.seed as u64 };
+            let kind = pb::generator::NoiseKind::try_from(n.kind)
+                .map_err(|_| bad("unknown noise kind"))?;
+            let signal = match (kind, n.period_frames) {
+                (pb::generator::NoiseKind::White, 0) => Signal::WhiteNoise { seed },
+                (pb::generator::NoiseKind::Pink, 0) => Signal::PinkNoise { seed },
+                (pb::generator::NoiseKind::White, p) => Signal::PeriodicNoise {
+                    seed,
+                    period_frames: p as usize,
+                },
+                (pb::generator::NoiseKind::Pink, _) => {
+                    return Err(bad("periodic pink noise is not supported yet"));
+                }
+                (pb::generator::NoiseKind::Unspecified, _) => {
+                    return Err(bad("noise kind is required"));
+                }
+            };
+            (signal, None)
+        }
+        Some(S::Square(s)) => (
+            Signal::Square {
+                hz: s.frequency_hz as f64,
+            },
+            None,
+        ),
+        None => return Err(bad("generator without signal")),
+    };
+    let level = match (&g.level, sine_dbfs) {
+        (
+            Some(pb::generator::Level {
+                unit: Some(pb::generator::level::Unit::PeakDbfs(db)),
+            }),
+            _,
+        ) => GenLevel::PeakDbfs(*db as f64),
+        (
+            Some(pb::generator::Level {
+                unit: Some(pb::generator::level::Unit::DbvRms(db)),
+            }),
+            _,
+        ) => GenLevel::DbvRms(*db as f64),
+        (_, Some(db)) => GenLevel::PeakDbfs(db),
+        (_, None) => return Err(bad("generator level is required for this signal")),
+    };
+    let output_channels = g
+        .output_channels
+        .iter()
+        .map(|&c| u16::try_from(c).map_err(|_| bad("output channel out of range")))
+        .collect::<Result<Vec<u16>, _>>()?;
+    Ok(GeneratorSpec {
+        signal,
+        level,
+        output_channels,
+    })
+}
+
+pub fn event(e: &Event) -> Option<pb::Event> {
+    let kind = match e {
+        Event::StreamOverrun {
+            stream_id,
+            dropped_blocks,
+        } => pb::event::Kind::StreamOverrun(pb::event::StreamOverrun {
+            stream_id: *stream_id,
+            dropped_blocks: *dropped_blocks,
+        }),
+        Event::RangeChanged {
+            session_id,
+            input_range,
+            output_range,
+        } => pb::event::Kind::RangeChanged(pb::event::RangeChanged {
+            session_id: *session_id,
+            input_range: input_range.map(|x| x as u32),
+            output_range: output_range.map(|x| x as u32),
+        }),
+        Event::StreamEnded { .. } => return None,
+    };
+    Some(pb::Event { kind: Some(kind) })
 }
 
 pub fn scale(s: Scale) -> pb::Scale {

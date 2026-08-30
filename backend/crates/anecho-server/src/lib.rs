@@ -95,14 +95,18 @@ async fn connection(socket: WebSocket, engine: Arc<Engine>) {
             }
             ev = events.recv() => {
                 match ev {
-                    Ok(Event::StreamOverrun { stream_id, dropped_blocks }) if my_streams.contains(&stream_id) => {
-                        let env = envelope(0, Payload::Event(pb::Event {
-                            kind: Some(pb::event::Kind::StreamOverrun(pb::event::StreamOverrun { stream_id, dropped_blocks })),
-                        }));
-                        if sink.send(Message::Binary(encode_envelope(&env))).await.is_err() { break; }
-                    }
                     Ok(Event::StreamEnded { stream_id }) => { my_streams.remove(&stream_id); }
-                    Ok(_) => {}
+                    Ok(ev) => {
+                        let mine = match &ev {
+                            Event::StreamOverrun { stream_id, .. } => my_streams.contains(stream_id),
+                            Event::RangeChanged { session_id, .. } => my_sessions.contains(session_id),
+                            Event::StreamEnded { .. } => false,
+                        };
+                        if mine && let Some(pb_ev) = convert::event(&ev) {
+                            let env = envelope(0, Payload::Event(pb_ev));
+                            if sink.send(Message::Binary(encode_envelope(&env))).await.is_err() { break; }
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

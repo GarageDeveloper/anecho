@@ -54,15 +54,25 @@ enum Cmd {
         device: String,
         #[arg(long, default_value_t = 48_000)]
         sample_rate: u32,
-        /// Drive the outputs with a sine: `<frequency_hz>,<amplitude_dbfs>`.
+        /// Drive the outputs with a sine: `<frequency_hz>,<amplitude_dbfs>` (alias of
+        /// `--signal sine:<hz> --level <dbfs>dBFS`).
         #[arg(long)]
         sine: Option<String>,
+        /// Drive the outputs: `sine:1000`, `dual:60,7000[,12]`, `multi:100,1000,10000`,
+        /// `white`, `pink`, `periodic[:frames]`, `square:1000`.
+        #[arg(long)]
+        signal: Option<String>,
+        /// Generator level: `-20dBFS` (peak) or `-10dBV` (RMS, calibrated devices only).
+        #[arg(long)]
+        level: Option<String>,
         #[arg(long, default_value_t = 2.0)]
         seconds: f64,
         #[arg(long, default_value_t = 10.0)]
         rate_hz: f32,
     },
 }
+
+mod cli;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -114,6 +124,8 @@ async fn main() -> anyhow::Result<()> {
             device,
             sample_rate,
             sine,
+            signal,
+            level,
             seconds,
             rate_hz,
         } => {
@@ -128,19 +140,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await
                 .context("open session")?;
-            let generator = match sine {
-                None => None,
-                Some(s) => {
-                    let (f, a) = s.split_once(',').context("--sine expects <hz>,<dbfs>")?;
-                    Some(pb::Generator {
-                        signal: Some(pb::generator::Signal::Sine(pb::generator::Sine {
-                            frequency_hz: f.trim().parse()?,
-                            amplitude_dbfs: a.trim().parse()?,
-                        })),
-                        ..Default::default()
-                    })
-                }
-            };
+            let generator = cli::generator(signal.as_deref(), level.as_deref(), sine.as_deref())?;
             let mut frames = client.frames();
             let stream = client
                 .start_stream(pb::StartStreamRequest {

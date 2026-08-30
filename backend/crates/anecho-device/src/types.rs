@@ -113,6 +113,9 @@ pub struct DeviceConfig {
     pub input_channels: Vec<u16>,
     /// Physical output channels to drive, in block order. Empty = all.
     pub output_channels: Vec<u16>,
+    /// Let the engine pick the input range from the signal (devices with ranges). Backends
+    /// ignore it; the engine implements the policy.
+    pub auto_range_input: bool,
 }
 
 impl DeviceConfig {
@@ -123,6 +126,7 @@ impl DeviceConfig {
             output_range: None,
             input_channels: Vec::new(),
             output_channels: Vec::new(),
+            auto_range_input: false,
         }
     }
 }

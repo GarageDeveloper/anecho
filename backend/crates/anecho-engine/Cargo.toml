@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 anecho-device.workspace = true
+anecho-dsp.workspace = true
 anecho-wire.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
