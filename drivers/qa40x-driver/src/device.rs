@@ -123,6 +123,10 @@ pub struct QA40xDevice {
     virtual_active: Arc<AtomicBool>,
 }
 
+/// Wait between the intermediate 18 dBV write and the target write when the input
+/// attenuator drops out (see `set_input_gain`).
+pub const ATTENUATOR_OUT_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
 impl QA40xDevice {
     /// Create a new QA40x device instance
     pub fn new() -> Self {
@@ -1035,10 +1039,28 @@ impl QA40xDevice {
         // Idempotent: the INPUT_GAIN register drives a mechanical relay, so
         // writing it clicks even when the value is unchanged. Skip redundant
         // sets so a repeated config-apply doesn't machine-gun the relay.
-        if self.config.lock().await.input_gain == gain {
+        let current = self.config.lock().await.input_gain;
+        if current == gain {
             return Ok(());
         }
         info!("Setting input gain to {} dBV", gain.as_dbv());
+
+        // Attenuator-out crossing (>= 24 dBV -> < 24 dBV) — hardware quirk measured on a
+        // QA403 (2026-08-30, resistive loopback, 1 kHz): a single register write leaves
+        // the input attenuator engaged for roughly a second in about half of the cases
+        // (the capture then reads ~24 dB low with the register reading back correctly).
+        // Writing 18 dBV first, waiting 150 ms, then writing the target was 0/18 failures
+        // versus 9/18 for a direct write followed by the same wait. Attenuator-in
+        // crossings and moves inside a group never failed.
+        if current.attenuator_engaged()
+            && !gain.attenuator_engaged()
+            && gain != InputGain::Gain18dBV
+        {
+            let step = InputGain::Gain18dBV.as_register_value();
+            self.write_register(registers::INPUT_GAIN, &step.to_be_bytes())
+                .await?;
+            tokio::time::sleep(ATTENUATOR_OUT_STEP_DELAY).await;
+        }
         let value = gain.as_register_value();
         self.write_register(registers::INPUT_GAIN, &value.to_be_bytes())
             .await?;

@@ -234,6 +234,12 @@ impl InputGain {
     pub fn as_register_value(&self) -> u32 {
         *self as u32
     }
+
+    /// The hardware engages its analogue input attenuator for the upper ranges
+    /// (>= 24 dBV). There is no register for it; it is a pure function of the range.
+    pub fn attenuator_engaged(&self) -> bool {
+        self.as_dbv() >= 24
+    }
 }
 
 impl From<InputGain> for i32 {
