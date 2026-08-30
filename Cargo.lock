@@ -74,6 +74,7 @@ dependencies = [
  "anecho-server",
  "anecho-wire",
  "anyhow",
+ "async-trait",
  "clap",
  "env_logger",
  "log",

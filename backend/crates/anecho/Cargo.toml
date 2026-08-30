@@ -29,5 +29,8 @@ env_logger.workspace = true
 log.workspace = true
 anyhow.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true
