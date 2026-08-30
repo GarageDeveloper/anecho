@@ -65,6 +65,9 @@ pub struct DeviceDescriptor {
     /// Free-form transport detail (USB bus/port, audio host name...).
     pub transport: String,
     pub capabilities: Capabilities,
+    /// Firmware/driver version reported by the device; USB analyzers know it only once
+    /// opened (`None` at enumeration).
+    pub firmware_version: Option<String>,
 }
 
 /// Whether absolute units are known for this device.

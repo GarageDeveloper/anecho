@@ -35,7 +35,9 @@
     {/if}
   </div>
   {#if locked}
-    <div class="muted">Session open — stop to change the configuration.</div>
+    <div class="muted">
+      Session open{#if app.firmwareVersion} · firmware {app.firmwareVersion}{/if} — stop to change the configuration.
+    </div>
   {/if}
 {/if}
 

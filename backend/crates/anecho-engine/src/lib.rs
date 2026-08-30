@@ -180,7 +180,7 @@ impl Engine {
         &self,
         device_id: &DeviceId,
         config: DeviceConfig,
-    ) -> Result<(u64, anecho_device::AppliedConfig)> {
+    ) -> Result<(u64, anecho_device::AppliedConfig, DeviceDescriptor)> {
         let device: Arc<dyn MeasurementDevice> = {
             let mut open = self.open_devices.lock().await;
             open.retain(|_, w| w.strong_count() > 0);
@@ -196,6 +196,7 @@ impl Engine {
         };
         let auto_range = config.auto_range_input;
         let applied = device.configure(config).await?;
+        let descriptor = device.descriptor().clone();
         let id = {
             let mut n = self.next_session.lock().await;
             let id = *n;
@@ -211,7 +212,7 @@ impl Engine {
                 auto_range,
             },
         );
-        Ok((id, applied))
+        Ok((id, applied, descriptor))
     }
 
     pub async fn close_session(&self, session_id: u64) -> Result<()> {

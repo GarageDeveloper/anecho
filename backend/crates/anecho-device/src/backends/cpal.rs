@@ -69,6 +69,7 @@ impl CpalBackend {
                 synchronous_io: false,
                 nominal_latency_frames: None,
             },
+            firmware_version: None,
         })
     }
 

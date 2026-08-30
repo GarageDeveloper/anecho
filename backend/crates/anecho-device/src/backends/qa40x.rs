@@ -141,6 +141,7 @@ impl Qa40xBackend {
                 synchronous_io: true,
                 nominal_latency_frames: None,
             },
+            firmware_version: d.identity.firmware_version.map(|v| v.to_string()),
         }
     }
 

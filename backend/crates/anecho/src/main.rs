@@ -237,14 +237,19 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Devices { url } => {
             for d in Client::connect(&url).await?.list_devices().await? {
                 println!(
-                    "{}\n    {} | in={} out={} rates={:?} calibrated={} sync={}",
+                    "{}\n    {} | in={} out={} rates={:?} calibrated={} sync={}{}",
                     d.id,
                     d.display_name,
                     d.input_channels,
                     d.output_channels,
                     d.sample_rates,
                     d.factory_calibrated,
-                    d.synchronous_io
+                    d.synchronous_io,
+                    if d.firmware_version.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" firmware={}", d.firmware_version)
+                    }
                 );
             }
         }
@@ -459,6 +464,13 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await
                 .context("open session")?;
+            if let Some(dev) = session
+                .device
+                .as_ref()
+                .filter(|d| !d.firmware_version.is_empty())
+            {
+                println!("{} firmware {}", dev.display_name, dev.firmware_version);
+            }
             let m = client
                 .measure(pb::MeasureRequest {
                     session_id: session.session_id,

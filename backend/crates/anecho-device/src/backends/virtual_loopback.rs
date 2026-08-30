@@ -70,6 +70,7 @@ impl VirtualLoopbackBackend {
                 synchronous_io: true,
                 nominal_latency_frames: Some(self.options.latency_frames),
             },
+            firmware_version: None,
         }
     }
 }

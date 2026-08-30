@@ -38,6 +38,9 @@
       in {d.inputChannels} · out {d.outputChannels} · {d.sampleRates.map((r) => r / 1000).join("/")} kHz
     </div>
     <div class="muted small">{d.id}</div>
+    {#if app.firmwareVersion}
+      <div class="muted small">firmware {app.firmwareVersion}</div>
+    {/if}
   </div>
 {:else if app.connection === "connected"}
   <div class="muted">No device found.</div>

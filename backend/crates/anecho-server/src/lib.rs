@@ -150,11 +150,12 @@ async fn handle(
                 Ok(cfg) => engine
                     .open_session(&anecho_device::DeviceId(req.device_id), cfg)
                     .await
-                    .map(|(session_id, applied)| {
+                    .map(|(session_id, applied, descriptor)| {
                         my_sessions.insert(session_id);
                         Payload::SessionOpened(pb::OpenSessionResponse {
                             session_id,
                             applied: Some(convert::applied_config(&applied)),
+                            device: Some(convert::device_info(&descriptor)),
                         })
                     }),
                 Err(e) => Err(e),

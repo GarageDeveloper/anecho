@@ -105,6 +105,8 @@ class AppState {
   outputRange = $state<number | undefined>(undefined);
   autoRangeInput = $state(false);
   sessionId = $state<bigint | null>(null);
+  /** Firmware version of the opened device (known once the session is open). */
+  firmwareVersion = $state("");
   stream = $state<StartStreamResponse | null>(null);
   tab = $state<Tab>("levels");
   levels = $state<ChannelLevel[]>([]);
@@ -146,6 +148,7 @@ class AppState {
         this.connection = "disconnected";
         this.client = null;
         this.sessionId = null;
+        this.firmwareVersion = "";
         this.clearStream();
       });
       c.onFrame((f) => this.onFrame(f));
@@ -270,6 +273,7 @@ class AppState {
     });
     const session = await c.openSession(d.id, config);
     this.sessionId = session.sessionId;
+    this.firmwareVersion = session.device?.firmwareVersion ?? "";
     return session.sessionId;
   }
 

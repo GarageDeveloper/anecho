@@ -86,6 +86,9 @@ message DeviceInfo {
   repeated Range output_ranges = 10;
   bool synchronous_io = 11;      // generation and capture sample-synchronous by construction
   optional uint32 nominal_latency_frames = 12;
+  // v0.2 — firmware/driver version as reported by the device, when known. USB analyzers
+  // report it once opened: empty in ListDevices, filled in OpenSessionResponse.device.
+  string firmware_version = 13;
 }
 
 message ListDevicesResponse {
@@ -115,6 +118,7 @@ message OpenSessionRequest {
 message OpenSessionResponse {
   uint64 session_id = 1;
   DeviceConfig applied = 2;   // ranges resolved, channel lists expanded
+  DeviceInfo device = 3;      // v0.2 — the opened device, enriched (firmware version...)
 }
 
 message CloseSessionRequest {

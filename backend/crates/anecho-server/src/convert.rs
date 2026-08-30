@@ -38,6 +38,7 @@ pub fn device_info(d: &DeviceDescriptor) -> pb::DeviceInfo {
         output_ranges: c.output_ranges.iter().map(range).collect(),
         synchronous_io: c.synchronous_io,
         nominal_latency_frames: c.nominal_latency_frames,
+        firmware_version: d.firmware_version.clone().unwrap_or_default(),
     }
 }
 
