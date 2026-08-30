@@ -1,35 +1,225 @@
 // Anecho — API contract v0.
 //
 // Transport: WebSocket. Control messages and events use the protobuf `Envelope` below
-// (WebSocket binary messages). Real-time streams (level meters, RTA, ...) travel as raw
-// binary frames of Float32 values referenced by `stream_id`; their layout is documented
-// where the stream is defined.
+// (WebSocket binary messages). Real-time streams (level meters, raw audio, ...) travel as
+// raw binary frames of Float32 values referenced by `stream_id` — see `BinaryFrame`.
 //
 // Evolution rules: additive only — new optional fields and new `oneof` variants. Never
 // rename, renumber or remove anything before a major version. `buf breaking` enforces this.
 syntax = "proto3";
 package anecho.v0;
 
+// ---------------------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------------------
+
+// Every control message. Requests carry a client-chosen `request_id`; the matching
+// response echoes it. Server-initiated events use `request_id = 0`.
 message Envelope {
   uint64 request_id = 1;
   oneof payload {
     ListDevicesRequest list_devices = 10;
     ListDevicesResponse devices = 11;
-    // Phase 0: sessions, streams, level meters. Later phases: additive only.
+
+    GetVersionRequest get_version = 12;
+    GetVersionResponse version = 13;
+
+    OpenSessionRequest open_session = 20;
+    OpenSessionResponse session_opened = 21;
+    CloseSessionRequest close_session = 22;
+    CloseSessionResponse session_closed = 23;
+
+    StartStreamRequest start_stream = 30;
+    StartStreamResponse stream_started = 31;
+    StopStreamRequest stop_stream = 32;
+    StopStreamResponse stream_stopped = 33;
+
+    Error error = 90;
+    Event event = 91;
   }
 }
 
+// ---------------------------------------------------------------------------------------
+// Version
+// ---------------------------------------------------------------------------------------
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string backend_version = 1;   // semver of the anecho backend
+  string contract_version = 2;  // e.g. "v0"
+}
+
+// ---------------------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------------------
+
 message ListDevicesRequest {}
+
+enum BackendKind {
+  BACKEND_KIND_UNSPECIFIED = 0;
+  BACKEND_KIND_QA40X = 1;    // QuantAsylum QA402/QA403, native USB
+  BACKEND_KIND_CPAL = 2;     // generic sound card (WASAPI, ASIO, Core Audio, ALSA, ...)
+  BACKEND_KIND_VIRTUAL = 3;  // in-process loopback used by tests
+}
+
+// A selectable input or output range.
+message Range {
+  float full_scale_dbv = 1;  // RMS of a full-scale sine, in dBV
+  string label = 2;
+}
 
 message DeviceInfo {
   string id = 1;
   string display_name = 2;
-  bool factory_calibrated = 3;   // true: QA40x; false: generic sound card
+  bool factory_calibrated = 3;   // true: absolute volts known (QA40x); false: dBFS only
   repeated uint32 sample_rates = 4;
   uint32 input_channels = 5;
   uint32 output_channels = 6;
+  BackendKind backend = 7;
+  string transport = 8;          // free-form: USB path, audio host name...
+  repeated Range input_ranges = 9;
+  repeated Range output_ranges = 10;
+  bool synchronous_io = 11;      // generation and capture sample-synchronous by construction
+  optional uint32 nominal_latency_frames = 12;
 }
 
 message ListDevicesResponse {
   repeated DeviceInfo devices = 1;
+}
+
+// ---------------------------------------------------------------------------------------
+// Sessions — one opened device with an applied configuration
+// ---------------------------------------------------------------------------------------
+
+message DeviceConfig {
+  uint32 sample_rate = 1;
+  optional uint32 input_range = 2;   // index into DeviceInfo.input_ranges
+  optional uint32 output_range = 3;  // index into DeviceInfo.output_ranges
+  repeated uint32 input_channels = 4;   // physical channels to capture; empty = all
+  repeated uint32 output_channels = 5;  // physical channels to drive; empty = all
+}
+
+message OpenSessionRequest {
+  string device_id = 1;
+  DeviceConfig config = 2;
+}
+
+message OpenSessionResponse {
+  uint64 session_id = 1;
+  DeviceConfig applied = 2;   // ranges resolved, channel lists expanded
+}
+
+message CloseSessionRequest {
+  uint64 session_id = 1;
+}
+
+message CloseSessionResponse {}
+
+// ---------------------------------------------------------------------------------------
+// Streams — real-time data flowing as binary frames
+// ---------------------------------------------------------------------------------------
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  // Level meter: per channel [rms, peak] in the stream's scale, decimated to
+  // `levels_rate_hz`. values_per_channel = 2.
+  STREAM_KIND_LEVELS = 1;
+  // Raw captured audio: per channel `block_frames` samples in dBFS (±1.0 full scale).
+  // values_per_channel = block_frames.
+  STREAM_KIND_RAW_INPUT = 2;
+}
+
+// How to interpret values of a stream.
+message Scale {
+  oneof unit {
+    bool dbfs = 1;            // only dBFS is meaningful
+    float dbv_offset = 2;     // dBV = dBFS + dbv_offset (factory-calibrated devices)
+  }
+}
+
+// Documentation of the binary frame layout (never sent as protobuf). All little-endian:
+//   u32  stream_id
+//   u64  seq                 monotonic per stream, starting at 0
+//   u64  first_frame         index of the first audio frame covered, since stream start
+//   u16  channels
+//   u16  values_per_channel
+//   f32  values[channels * values_per_channel]   channel-major (all values of ch 0, then ch 1...)
+message BinaryFrame {
+  uint32 stream_id = 1;
+  uint64 seq = 2;
+  uint64 first_frame = 3;
+  uint32 channels = 4;
+  uint32 values_per_channel = 5;
+  repeated float values = 6;
+}
+
+// A generated test signal (phase 0: sine only; later phases add the full generator).
+message Generator {
+  oneof signal {
+    Sine sine = 1;
+  }
+  message Sine {
+    float frequency_hz = 1;
+    float amplitude_dbfs = 2;   // peak amplitude, 0 dBFS = full scale
+  }
+}
+
+message StartStreamRequest {
+  uint64 session_id = 1;
+  StreamKind kind = 2;
+  uint32 block_frames = 3;       // capture block size; 0 = backend default
+  float levels_rate_hz = 4;      // LEVELS only; 0 = default (20 Hz)
+  optional Generator generator = 5;  // drive the outputs while streaming
+}
+
+message StartStreamResponse {
+  uint32 stream_id = 1;
+  StreamKind kind = 2;
+  uint32 channels = 3;
+  uint32 sample_rate = 4;
+  Scale scale = 5;
+  uint32 values_per_channel = 6;
+}
+
+message StopStreamRequest {
+  uint32 stream_id = 1;
+}
+
+message StopStreamResponse {}
+
+// ---------------------------------------------------------------------------------------
+// Errors and events
+// ---------------------------------------------------------------------------------------
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_BAD_REQUEST = 1;
+  ERROR_CODE_NOT_FOUND = 2;
+  ERROR_CODE_BUSY = 3;
+  ERROR_CODE_UNSUPPORTED = 4;
+  ERROR_CODE_DEVICE = 5;
+  ERROR_CODE_INTERNAL = 6;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+message Event {
+  oneof kind {
+    DeviceListChanged device_list_changed = 1;
+    DeviceLost device_lost = 2;
+    StreamOverrun stream_overrun = 3;
+  }
+  message DeviceListChanged {}
+  message DeviceLost {
+    uint64 session_id = 1;
+    string device_id = 2;
+  }
+  message StreamOverrun {
+    uint32 stream_id = 1;
+    uint32 dropped_blocks = 2;
+  }
 }

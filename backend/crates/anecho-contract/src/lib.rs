@@ -30,6 +30,7 @@ mod tests {
                     sample_rates: vec![48_000, 96_000, 192_000, 384_000],
                     input_channels: 2,
                     output_channels: 2,
+                    ..Default::default()
                 }],
             })),
         };
