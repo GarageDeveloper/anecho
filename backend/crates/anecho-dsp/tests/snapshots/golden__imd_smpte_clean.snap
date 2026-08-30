@@ -1,5 +1,6 @@
 ---
 source: backend/crates/anecho-dsp/tests/golden.rs
+assertion_line: 110
 expression: "((r.imd_pct * 1e6).round() / 1e6,\nr.products.iter().map(|(hz, db)| (r3(*hz), r3(*db))).collect::<Vec<_>>())"
 ---
 [
@@ -7,35 +8,35 @@ expression: "((r.imd_pct * 1e6).round() / 1e6,\nr.products.iter().map(|(hz, db)|
   [
     [
       6940.0,
-      -176.492
+      -175.39
     ],
     [
       7060.0,
-      -166.843
+      -166.71
     ],
     [
       6880.0,
-      -169.225
+      -169.009
     ],
     [
       7120.0,
-      -168.453
+      -168.28
     ],
     [
       6820.0,
-      -174.668
+      -174.27
     ],
     [
       7180.0,
-      -168.944
+      -168.84
     ],
     [
       6760.0,
-      -170.31
+      -170.219
     ],
     [
       7240.0,
-      -177.868
+      -177.408
     ]
   ]
 ]

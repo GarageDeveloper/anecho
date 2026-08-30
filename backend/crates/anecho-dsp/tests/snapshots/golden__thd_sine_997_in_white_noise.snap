@@ -1,45 +1,46 @@
 ---
 source: backend/crates/anecho-dsp/tests/golden.rs
+assertion_line: 91
 expression: "thd_snapshot(&x, Window::BlackmanHarris7)"
 ---
 {
   "fundamental_hz": 996.999,
   "fundamental_level_db": -9.996,
-  "thd_pct": 0.002,
-  "thd_db": -93.962,
-  "thd_n_pct": 0.03041,
+  "thd_pct": 0.00241,
+  "thd_db": -92.356,
+  "thd_n_pct": 0.02901,
   "harmonics_db_rel": [
     [
       2,
-      -107.028
+      -101.148
     ],
     [
       3,
-      -98.746
+      -98.118
     ],
     [
       4,
-      -105.699
+      -104.823
     ],
     [
       5,
-      -106.968
+      -106.674
     ],
     [
       6,
-      -102.85
+      -101.924
     ],
     [
       7,
-      -102.58
+      -100.628
     ],
     [
       8,
-      -103.173
+      -100.254
     ],
     [
       9,
-      -103.37
+      -102.944
     ]
   ],
   "noise_floor_db": -122.508

@@ -56,13 +56,16 @@ impl Window {
     }
 
     /// Bins on each side of a sine's bin that hold its main lobe (used to sum the power of
-    /// a spectral line): rectangular 1, Hann 2, Blackman-Harris 4-term 4, 7-term 5, flat-top 5.
+    /// a spectral line): rectangular 1, Hann 2, Blackman-Harris 4-term 4, 7-term 7, flat-top 5.
     pub fn main_lobe_bins(self) -> usize {
         match self {
             Window::Rectangular => 1,
             Window::Hann => 2,
             Window::BlackmanHarris4 => 4,
-            Window::BlackmanHarris7 => 5,
+            // Measured on a bin-centred tone: the 7-term window still carries -96 dBc at
+            // ±6 bins and reaches its sidelobe floor (< -125 dBc) from ±8 on, so the lobe
+            // is ±7 bins (2026-08-30, QA403 loopback, N = 65536).
+            Window::BlackmanHarris7 => 7,
             Window::FlatTop => 5,
         }
     }

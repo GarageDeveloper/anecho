@@ -31,6 +31,7 @@ qa40x-driver = { path = "../../../drivers/qa40x-driver", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+anecho-dsp.workspace = true
 env_logger = "0.11"
 
 [lints]
@@ -47,3 +48,7 @@ required-features = ["qa40x"]
 [[example]]
 name = "qa40x_sim_profile"
 required-features = ["qa40x-sim"]
+
+[[example]]
+name = "qa40x_thdn_breakdown"
+required-features = ["qa40x"]

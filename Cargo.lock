@@ -119,6 +119,7 @@ dependencies = [
 name = "anecho-device"
 version = "0.1.0"
 dependencies = [
+ "anecho-dsp",
  "async-trait",
  "cpal",
  "env_logger",

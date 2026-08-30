@@ -4,7 +4,7 @@
 //! and the window's noise bandwidth `ENBW`:
 //!
 //! - Power of a spectral line at bin `k`: `P = Σ_{|j−k| ≤ m} P_j / ENBW` with
-//!   `m = Window::main_lobe_bins()` (rectangular 1, Hann 2, BH4 4, BH7 5, flat-top 5).
+//!   `m = Window::main_lobe_bins()` (rectangular 1, Hann 2, BH4 4, BH7 7, flat-top 5).
 //! - Fundamental `f0`: the highest bin in the analysis band (or within ±5 % of the hint),
 //!   refined by parabolic interpolation of the dB magnitudes of the three bins around it:
 //!   `δ = ½ (α − γ) / (α − 2β + γ)` bins, `f0 = (k + δ)·fs/N`.

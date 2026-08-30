@@ -109,6 +109,23 @@ impl Engine {
             ));
         }
         let sample_rate = applied.sample_rate;
+        // Snap generator tones to the FFT bin grid (k · fs / N): a tone centred on a bin
+        // has no scalloping loss and no leakage skirt, which is what makes THD+N reach the
+        // converter's noise floor instead of the window's main lobe (REW does the same
+        // for its distortion figures). The reported fundamental is the snapped one.
+        let bin_hz = sample_rate as f64 / fft_length as f64;
+        let snap = |hz: f64| ((hz / bin_hz).round().max(1.0)) * bin_hz;
+        let mut req = req;
+        if let Some(g) = req.generator.as_mut() {
+            match &mut g.signal {
+                Signal::Sine { hz } | Signal::Square { hz } => *hz = snap(*hz),
+                Signal::DualTone { f1, f2, .. } => {
+                    *f1 = snap(*f1);
+                    *f2 = snap(*f2);
+                }
+                _ => {}
+            }
+        }
         let hint = req.generator.as_ref().and_then(|g| match g.signal {
             Signal::Sine { hz } | Signal::Square { hz } => Some(hz),
             _ => None,

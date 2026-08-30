@@ -1,5 +1,6 @@
 ---
 source: backend/crates/anecho-dsp/tests/golden.rs
+assertion_line: 77
 expression: "thd_snapshot(&x, Window::BlackmanHarris7)"
 ---
 {
@@ -7,7 +8,7 @@ expression: "thd_snapshot(&x, Window::BlackmanHarris7)"
   "fundamental_level_db": -6.018,
   "thd_pct": 0.10488,
   "thd_db": -59.586,
-  "thd_n_pct": 0.10515,
+  "thd_n_pct": 0.10488,
   "harmonics_db_rel": [
     [
       2,
@@ -19,7 +20,7 @@ expression: "thd_snapshot(&x, Window::BlackmanHarris7)"
     ],
     [
       4,
-      -184.757
+      -184.746
     ],
     [
       5,
@@ -27,7 +28,7 @@ expression: "thd_snapshot(&x, Window::BlackmanHarris7)"
     ],
     [
       6,
-      -176.742
+      -176.741
     ],
     [
       7,
