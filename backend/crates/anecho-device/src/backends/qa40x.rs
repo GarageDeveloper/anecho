@@ -516,7 +516,7 @@ impl Worker {
             if self.cfg.generate {
                 source.fill(&mut inter, 2, sr);
             }
-            for (i, fr) in inter.chunks_exact(2).enumerate() {
+            for (i, fr) in inter.as_chunks::<2>().0.iter().enumerate() {
                 left[i] = if drive_l { fr[0] } else { 0.0 };
                 right[i] = if drive_r { fr[1] } else { 0.0 };
             }
