@@ -1,0 +1,9 @@
+# QuantAsylum QA402 / QA403 audio analyzers — USB access for non-root users.
+# Installed by the qa40x-rs .deb/.rpm packages under /usr/lib/udev/rules.d/
+# (the package location; /etc/udev/rules.d/ stays free for admin overrides).
+SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="4e37", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="4e39", MODE="0666"
+# NXP MCUBOOT/KBOOT bootloader — the analyzer re-enumerates as this (HID) during
+# firmware flashing; without access to its hidraw node the flash cannot start.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1fc9", ATTR{idProduct}=="0022", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1fc9", ATTRS{idProduct}=="0022", MODE="0666"

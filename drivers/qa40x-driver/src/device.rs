@@ -1,0 +1,2048 @@
+#[cfg(feature = "sim")]
+use crate::transport::{VirtEp, demo_sim_options};
+use crate::{
+    calpage_crc::calibration_page_crc_ok,
+    error::{QA40xError, Result},
+    i2s::I2sWidth,
+    register::{RegisterOps, registers},
+    settle::{RANGE_RELAY_SETTLE, SettleDeadline},
+    transport::{BulkIn, BulkOut, EndpointQueue},
+    types::*,
+};
+use async_trait::async_trait;
+use log::{debug, info, warn};
+use nusb::transfer::{Buffer, Bulk, Completion, In, Out};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::Mutex;
+#[cfg(feature = "sim")]
+use vqa40x_core::Simulator;
+
+/// Device identity read at connect: firmware version + serial + product.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct DeviceMeta {
+    /// Detected model name ("QA402" / "QA403"), from the USB product ID.
+    pub model: String,
+    /// Firmware build number (register 0x10), e.g. 60.
+    pub firmware_version: u32,
+    /// Unit serial number, e.g. "AB12_CD34".
+    pub serial: String,
+    /// USB product string, e.g. "QA402 Audio Analyzer".
+    pub product: String,
+    /// Sample rates (Hz) this model supports — the frontend builds its menu from
+    /// this (QA403 adds 384 kHz).
+    pub sample_rates: Vec<u32>,
+    /// Whether firmware flashing is supported/verified for this model (QA402 only).
+    pub supports_flash: bool,
+    /// Per-model limits (output span, measurement band, fastest rate). See the
+    /// [`Capabilities`] doc for why the output Vrms limits are informational
+    /// for now (task #48).
+    pub capabilities: Capabilities,
+    /// True when this is the embedded virtual device (demo mode), not real
+    /// hardware — the UI badges the session so a demo can never be mistaken
+    /// for a measurement.
+    pub is_virtual: bool,
+}
+
+/// Live hardware telemetry, matching the official app's readout. Decoded from
+/// registers 0x11/0x12/0x13/0x16 (raw values also returned for verification).
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct Telemetry {
+    pub usb_voltage_v: f32,
+    pub usb_current_ma: f32,
+    pub iso_current_ma: f32,
+    pub temperature_c: f32,
+    pub raw_usb_voltage: u32,
+    pub raw_usb_current: u32,
+    pub raw_iso_current: u32,
+    pub raw_extra: u32,
+    pub raw_temperature: u32,
+}
+
+/// The four bulk endpoints, claimed exclusively at connect. nusb 0.2 replaced
+/// `interface.bulk_in/out(addr, ..)` with per-endpoint `Endpoint` objects that
+/// own a submission queue; we claim all four up front and submit/collect on
+/// them. Each is either a real nusb endpoint or a virtual one over the
+/// embedded simulator (demo mode) — same queue semantics either way.
+struct ClaimedEndpoints {
+    register_write: BulkOut,
+    register_read: BulkIn,
+    data_write: BulkOut,
+    data_read: BulkIn,
+}
+
+/// QA40x device controller (QA402 / QA403)
+pub struct QA40xDevice {
+    device: Arc<Mutex<Option<nusb::Device>>>,
+    interface: Arc<Mutex<Option<nusb::Interface>>>,
+    /// nusb 0.2 claimed endpoints (submit/next_complete live here).
+    eps: Arc<Mutex<Option<ClaimedEndpoints>>>,
+    /// The front-panel I2S OUT endpoint (0x03, issue #71) — deliberately NOT
+    /// in [`ClaimedEndpoints`]: `stream_pump` holds the `eps` mutex for a
+    /// WHOLE capture, and §10 of the device notes requires the I2S stream and
+    /// register I/O to keep flowing concurrently with an acquisition. Its own
+    /// cell keeps the paced I2S writer off every other endpoint's lock.
+    i2s_ep: Arc<Mutex<Option<BulkOut>>>,
+    endpoints: UsbEndpoints,
+    config: Arc<Mutex<DeviceConfig>>,
+    /// Cached raw 512-byte factory calibration page (loaded at connect).
+    cal_page: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Device identity (firmware version + serial), read at connect.
+    meta: Arc<Mutex<Option<DeviceMeta>>>,
+    /// Detected model (QA402/QA403), set at connect from the USB product ID.
+    /// Used to gate model-specific behaviour (sample rates, firmware flash).
+    model: Arc<Mutex<Option<Model>>>,
+    /// When the last LINK keepalive ran (idle poll, between-frame or
+    /// in-capture), for the shared ~1 Hz rate limit
+    /// ([`Self::take_keepalive_slot`]).
+    last_keepalive: Arc<Mutex<Option<std::time::Instant>>>,
+    /// COMPLETED keepalive cycles (link write + telemetry reads that all
+    /// succeeded), across every path. Distinct from the `last_keepalive`
+    /// stamp, which is taken BEFORE the attempt: validation must count
+    /// successes, not slots taken (issue #54 review, F1).
+    keepalive_ok: Arc<std::sync::atomic::AtomicU64>,
+    /// Telemetry captured by the most recent keepalive. Lets the UI refresh its
+    /// telemetry readout during a run without any USB I/O of its own.
+    cached_telemetry: Arc<Mutex<Option<Telemetry>>>,
+    /// "Not before T" deadline stamped by range-relay writes (reg 5/6) and
+    /// waited out by [`Self::stream_io`] before the next capture — never
+    /// inside one. See [`crate::settle`] for the model and timings.
+    relay_settle: Arc<Mutex<SettleDeadline>>,
+    /// The embedded virtual QA40x (demo mode), created on the first virtual
+    /// connect and kept for the whole app session — its state survives a demo
+    /// disconnect/reconnect the way a plugged-in unit survives a USB close.
+    #[cfg(feature = "sim")]
+    virtual_sim: Arc<Mutex<Option<Simulator>>>,
+    /// True while the CURRENT connection is the virtual device. Presence
+    /// checks short-circuit on it: the demo device is not on the USB bus.
+    virtual_active: Arc<AtomicBool>,
+}
+
+impl QA40xDevice {
+    /// Create a new QA40x device instance
+    pub fn new() -> Self {
+        Self {
+            device: Arc::new(Mutex::new(None)),
+            interface: Arc::new(Mutex::new(None)),
+            eps: Arc::new(Mutex::new(None)),
+            i2s_ep: Arc::new(Mutex::new(None)),
+            endpoints: UsbEndpoints::default(),
+            config: Arc::new(Mutex::new(DeviceConfig::default())),
+            cal_page: Arc::new(Mutex::new(None)),
+            meta: Arc::new(Mutex::new(None)),
+            model: Arc::new(Mutex::new(None)),
+            last_keepalive: Arc::new(Mutex::new(None)),
+            keepalive_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cached_telemetry: Arc::new(Mutex::new(None)),
+            relay_settle: Arc::new(Mutex::new(SettleDeadline::default())),
+            #[cfg(feature = "sim")]
+            virtual_sim: Arc::new(Mutex::new(None)),
+            virtual_active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Find and connect to a QA40x device (QA402 or QA403) — the first unit
+    /// on the bus, as always. Selecting a specific unit among several goes
+    /// through `crate::device` (issue #25 lot B), whose USB source opens by
+    /// serial via the same `connect_to_usb`. Signature frozen: the
+    /// examples and the A/B bench drive it directly.
+    pub async fn connect(&self) -> Result<()> {
+        info!(
+            "Searching for a QA40x device (VID: 0x{:04X}, PID 0x{:04X}/0x{:04X})",
+            QA40X_VID, QA402_PID, QA403_PID
+        );
+
+        self.release_claim().await;
+
+        // Match any known QA40x model (VID is shared; the PID picks the model).
+        let device_info = crate::discovery::usb::first_device_info()
+            .await
+            .map_err(QA40xError::from)?;
+
+        self.connect_to_usb(device_info).await
+    }
+
+    /// Release any prior claim so a reconnect (e.g. after the frontend
+    /// reloaded while the backend stayed connected) does not fail with
+    /// "could not claim interface 0: exclusive access". Dropping the stored
+    /// Interface releases the USB claim. Extracted verbatim from `connect()`
+    /// (issue #25 lot B) so the registry's open-by-serial path shares it.
+    pub(crate) async fn release_claim(&self) {
+        // Drop the claimed endpoints first (they hold refs to the interface),
+        // then the interface and device, so the OS releases the USB claim.
+        // The I2S cell too: its writer (if any) exits on the next iteration
+        // when it finds the cell empty.
+        *self.i2s_ep.lock().await = None;
+        *self.eps.lock().await = None;
+        self.release_virtual_import().await;
+        let mut iface = self.interface.lock().await;
+        if iface.is_some() {
+            info!("Releasing existing interface claim before reconnecting");
+            *iface = None;
+        }
+        *self.device.lock().await = None;
+        // Give the OS a moment to release the claim.
+        drop(iface);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// The open + claim + bring-up half of `connect()`, from an enumerated
+    /// `DeviceInfo` to a fully initialized session. Extracted verbatim
+    /// (issue #25 lot B): the caller picks the unit (first-match here,
+    /// by-serial in `crate::discovery::usb`), this takes it from there.
+    /// The caller must have released any prior claim first.
+    pub(crate) async fn connect_to_usb(&self, device_info: nusb::DeviceInfo) -> Result<()> {
+        let model = Model::from_pid(device_info.product_id()).unwrap_or(Model::Qa402);
+        *self.model.lock().await = Some(model);
+
+        info!("Found {} device", model.name());
+        info!(
+            "Device info - VID: 0x{:04X}, PID: 0x{:04X} ({})",
+            device_info.vendor_id(),
+            device_info.product_id(),
+            model.name()
+        );
+
+        let device = device_info
+            .open()
+            .await
+            .map_err(|e| QA40xError::DeviceError(format!("Failed to open device: {}", e)))?;
+
+        info!("Device opened successfully");
+
+        // Get available configurations
+        let first_config = device
+            .configurations()
+            .next()
+            .ok_or_else(|| QA40xError::DeviceError("No configurations found".to_string()))?;
+
+        let config_value = first_config.configuration_value();
+        info!("Found configuration with value: {}", config_value);
+
+        // Set the configuration if needed
+        // Note: Some devices are already configured, so we try to get active config first
+        let active_config = match device.active_configuration() {
+            Ok(config) => {
+                info!(
+                    "Device already has active configuration: {}",
+                    config.configuration_value()
+                );
+                config
+            }
+            Err(_) => {
+                info!(
+                    "No active configuration, setting configuration {}",
+                    config_value
+                );
+                device.set_configuration(config_value).await.map_err(|e| {
+                    QA40xError::DeviceError(format!("Failed to set configuration: {}", e))
+                })?;
+
+                // Get the configuration we just set
+                device.active_configuration().map_err(|e| {
+                    QA40xError::DeviceError(format!(
+                        "Failed to get active configuration after setting: {}",
+                        e
+                    ))
+                })?
+            }
+        };
+
+        info!(
+            "Active configuration value: {}",
+            active_config.configuration_value()
+        );
+
+        // Find the first interface - the QA40x uses interface 0
+        let interface_number = active_config
+            .interfaces()
+            .next()
+            .ok_or_else(|| {
+                QA40xError::DeviceError("No interfaces found in configuration".to_string())
+            })?
+            .interface_number();
+
+        info!("Using interface number: {}", interface_number);
+
+        // Claim the interface
+        let interface = device
+            .claim_interface(interface_number)
+            .await
+            .map_err(|e| {
+                QA40xError::DeviceError(format!(
+                    "Failed to claim interface {}: {}. Make sure no other application is using the device.",
+                    interface_number, e
+                ))
+            })?;
+
+        info!("Interface {} claimed successfully", interface_number);
+
+        // Claim the four bulk endpoints exclusively (nusb 0.2 model).
+        let ep_err = |what: &str, e: nusb::Error| {
+            QA40xError::DeviceError(format!("Failed to claim {what} endpoint: {e}"))
+        };
+        let mut eps = ClaimedEndpoints {
+            register_write: BulkOut::Usb(
+                interface
+                    .endpoint::<Bulk, Out>(self.endpoints.register_write)
+                    .map_err(|e| ep_err("register-write", e))?,
+            ),
+            register_read: BulkIn::Usb(
+                interface
+                    .endpoint::<Bulk, In>(self.endpoints.register_read)
+                    .map_err(|e| ep_err("register-read", e))?,
+            ),
+            data_write: BulkOut::Usb(
+                interface
+                    .endpoint::<Bulk, Out>(self.endpoints.data_write)
+                    .map_err(|e| ep_err("data-write", e))?,
+            ),
+            data_read: BulkIn::Usb(
+                interface
+                    .endpoint::<Bulk, In>(self.endpoints.data_read)
+                    .map_err(|e| ep_err("data-read", e))?,
+            ),
+        };
+
+        // Clear any stale endpoint halts before doing register I/O.
+        let _ = eps.register_write.clear_halt().await;
+        let _ = eps.register_read.clear_halt().await;
+        let _ = eps.data_write.clear_halt().await;
+        let _ = eps.data_read.clear_halt().await;
+
+        // Front-panel I2S OUT endpoint (0x03, issue #71) — best-effort: a
+        // firmware/OS that refuses the claim must still connect; the port
+        // then reports as unsupported (`i2s_available`).
+        let i2s_ep = match interface.endpoint::<Bulk, Out>(self.endpoints.i2s_write) {
+            Ok(mut ep) => {
+                let _ = ep.clear_halt().await;
+                Some(BulkOut::Usb(ep))
+            }
+            Err(e) => {
+                warn!(
+                    "I2S endpoint 0x{:02X} not claimed ({}); I2S output disabled",
+                    self.endpoints.i2s_write, e
+                );
+                None
+            }
+        };
+
+        *self.device.lock().await = Some(device);
+        *self.interface.lock().await = Some(interface);
+        *self.eps.lock().await = Some(eps);
+        *self.i2s_ep.lock().await = i2s_ep;
+
+        info!("Successfully connected to QA40x device");
+
+        let serial = device_info
+            .serial_number()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let product = device_info
+            .product_string()
+            .unwrap_or("QA40x Audio Analyzer")
+            .to_string();
+        self.init_device_session(model, serial, product, false)
+            .await
+    }
+
+    #[cfg(feature = "sim")]
+    /// Connect to the embedded virtual QA40x (demo mode): an in-process
+    /// `vqa40x-core` simulator behind the same four bulk-endpoint queues as
+    /// the hardware, so every code path above this line — registers,
+    /// streaming, calibration, telemetry, REST, scripts — runs unchanged.
+    /// No download, no USB/IP, no kernel module.
+    pub async fn connect_virtual(&self) -> Result<()> {
+        // First demo connect of the session creates the simulator; later ones
+        // reattach to it (its state persists like a unit left plugged in).
+        let sim = {
+            let mut slot = self.virtual_sim.lock().await;
+            if slot.is_none() {
+                let opts = demo_sim_options();
+                info!(
+                    "Starting embedded virtual {} (serial {}, demo mode)",
+                    opts.model.name(),
+                    opts.serial
+                );
+                *slot = Some(Simulator::new(opts));
+            }
+            slot.as_ref().expect("just created").clone()
+        };
+        self.connect_virtual_sim(sim, Model::Qa403).await
+    }
+
+    #[cfg(feature = "sim")]
+    /// Attach a specific simulator instance (issue #25 lot B): the virtual
+    /// device source owns its simulators (pinned serials, N units later) and
+    /// connects them through here; `connect_virtual()` keeps its historical
+    /// make-my-own-sim behavior on top of the same path. The sim is stored in
+    /// `virtual_sim` so disconnect/reconnect release-and-reattach semantics
+    /// are identical whichever door it came in through.
+    ///
+    /// OWNERSHIP: the slot always holds the LAST attached simulator — the
+    /// device is a borrower, not the owner. A process mixing both doors
+    /// (source-owned sim, then bare `connect_virtual()`) continues on
+    /// whichever sim was attached last; "state persists like a unit left
+    /// plugged in" is per simulator instance, not per device object. No app
+    /// runtime path mixes the two today (registry only); tests/examples that
+    /// call `connect_virtual()` directly never touch the registry's source.
+    pub async fn connect_virtual_sim(&self, sim: Simulator, model: Model) -> Result<()> {
+        // Release any prior claim (real or virtual), same as connect().
+        {
+            *self.i2s_ep.lock().await = None;
+            *self.eps.lock().await = None;
+            self.release_virtual_import().await;
+            *self.interface.lock().await = None;
+            *self.device.lock().await = None;
+        }
+
+        *self.virtual_sim.lock().await = Some(sim.clone());
+        if !sim.try_import() {
+            return Err(QA40xError::DeviceError(
+                "Virtual device is already attached".to_string(),
+            ));
+        }
+
+        let serial = sim.busid().to_string(); // placeholder; real serial read below
+        *self.model.lock().await = Some(model);
+        *self.eps.lock().await = Some(ClaimedEndpoints {
+            register_write: BulkOut::Virt(VirtEp::new(sim.clone(), self.endpoints.register_write)),
+            register_read: BulkIn::Virt(VirtEp::new(sim.clone(), self.endpoints.register_read)),
+            data_write: BulkOut::Virt(VirtEp::new(sim.clone(), self.endpoints.data_write)),
+            data_read: BulkIn::Virt(VirtEp::new(sim.clone(), self.endpoints.data_read)),
+        });
+        *self.i2s_ep.lock().await = Some(BulkOut::Virt(VirtEp::new(
+            sim.clone(),
+            self.endpoints.i2s_write,
+        )));
+        self.virtual_active.store(true, Ordering::SeqCst);
+
+        // The simulator serves the serial through register 0x1D as a packed
+        // u32 of its hex digits — read it back so the UI shows the same
+        // serial a USB enumeration would have carried.
+        let serial = match self.read_register(registers::SERIAL_NUMBER).await {
+            Ok(d) if d.len() == 4 => {
+                let v = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+                format!("{:04X}_{:04X}", v >> 16, v & 0xFFFF)
+            }
+            _ => serial,
+        };
+        let product = format!("{} Audio Analyzer (virtual)", model.name());
+
+        match self.init_device_session(model, serial, product, true).await {
+            Ok(()) => {
+                info!(
+                    "Demo mode: connected to the embedded virtual {}",
+                    model.name()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Leave no half-open virtual session behind.
+                self.mark_disconnected().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Detach from the embedded simulator (if this connection was virtual) so
+    /// the next demo connect can re-import it. Keeps the simulator itself —
+    /// its state lives for the whole app session.
+    async fn release_virtual_import(&self) {
+        self.virtual_active.store(false, Ordering::SeqCst);
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.virtual_sim.lock().await.as_ref() {
+            sim.release_import();
+        }
+    }
+
+    /// Whether the current connection is the embedded virtual device.
+    pub fn is_virtual(&self) -> bool {
+        self.virtual_active.load(Ordering::SeqCst)
+    }
+
+    /// The shared post-claim bring-up, identical for hardware and the virtual
+    /// device: quiesce leftover streaming, verify the register bus, replay the
+    /// vendor init write, read identity/config/calibration, and force the safe
+    /// 42 dBV input range.
+    async fn init_device_session(
+        &self,
+        model: Model,
+        serial: String,
+        product: String,
+        is_virtual: bool,
+    ) -> Result<()> {
+        // Stop any leftover streaming from a previous session BEFORE the verify
+        // register read. A process that died mid-stream can leave the QA40x
+        // streaming and unresponsive to register I/O; driving register 8 to 0
+        // and settling quiesces it so the verify read succeeds.
+        info!("Resetting streaming engine");
+        let _ = self
+            .write_register(
+                registers::STREAM_CTRL,
+                &registers::STREAM_STOP.to_be_bytes(),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify the connection by testing register write/read. If the device is
+        // still wedged, clear the endpoints and try the quiesce + verify once more.
+        if let Err(e) = self.verify_connection().await {
+            info!("Verify failed ({}); attempting recovery", e);
+            if let Some(eps) = self.eps.lock().await.as_mut() {
+                let _ = eps.data_write.clear_halt().await;
+                let _ = eps.data_read.clear_halt().await;
+                let _ = eps.register_write.clear_halt().await;
+                let _ = eps.register_read.clear_halt().await;
+            }
+            let _ = self
+                .write_register(
+                    registers::STREAM_CTRL,
+                    &registers::STREAM_STOP.to_be_bytes(),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.verify_connection().await?;
+        }
+
+        // Front-panel I2S off (reg 0x0A = 0), as the official app writes on
+        // every connect — part of putting the unit in a defined state. (This
+        // register was "unknown init" until a USB capture of the app's I2S
+        // feature identified it.) Also the I2S engine's contract (issue #71):
+        // the port always comes up OFF after a (re)connect, so engine state
+        // never claims a stream the device isn't running.
+        // Best-effort — must not block connecting.
+        let _ = self
+            .write_register(registers::I2S_CTRL, &0u32.to_be_bytes())
+            .await;
+
+        // Read device identity: firmware version (register 0x10) + serial. The
+        // firmware register was confirmed on hardware (a read-only scan showed
+        // 0x10 == the version the QuantAsylum app reports). Best-effort: identity
+        // is informational, so a read failure must not block connecting.
+        {
+            let firmware_version = match self.read_register(registers::FIRMWARE_VERSION).await {
+                Ok(d) if d.len() == 4 => u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+                _ => 0,
+            };
+            info!(
+                "Device identity: {} firmware v{}, serial {}",
+                model.name(),
+                firmware_version,
+                serial
+            );
+            *self.meta.lock().await = Some(DeviceMeta {
+                model: model.name().to_string(),
+                firmware_version,
+                serial,
+                product,
+                sample_rates: model.sample_rates().iter().map(|r| r.as_hz()).collect(),
+                // Never offer a firmware flash to the simulator: the demo
+                // must not exercise the DFU/HID path the fake bootloader
+                // can't complete in-process.
+                supports_flash: model.supports_flash() && !is_virtual,
+                capabilities: model.capabilities(),
+                is_virtual,
+            });
+        }
+
+        // Try to read current configuration from device
+        // If it fails (e.g., uninitialized registers), initialize with defaults
+        info!("Reading device configuration");
+        match self.read_config_from_device().await {
+            Ok(config) => {
+                info!(
+                    "Device configuration read successfully: input={} dBV, output={} dBV, rate={} Hz",
+                    config.input_gain.as_dbv(),
+                    config.output_gain.as_dbv(),
+                    config.sample_rate.as_hz()
+                );
+                // This reflects the device's CURRENT registers. On a real unplug
+                // the QA40x (USB-powered) reboots to its defaults, so the frontend
+                // re-applies the user's persisted input/output ranges at connect.
+            }
+            Err(e) => {
+                info!(
+                    "Unable to read device configuration ({}), initializing with defaults",
+                    e
+                );
+                let default_config = DeviceConfig::default();
+
+                self.set_input_gain(default_config.input_gain).await?;
+                self.set_output_gain(default_config.output_gain).await?;
+                self.set_sample_rate(default_config.sample_rate).await?;
+
+                info!("Device initialized with default configuration");
+            }
+        }
+
+        // Load the factory calibration page (best-effort) so frequency-response
+        // magnitudes can be reported as a real voltage gain.
+        match self.read_calibration_page().await {
+            Ok(page) => {
+                info!("Calibration page loaded ({} bytes)", page.len());
+                if !calibration_page_crc_ok(&page) {
+                    warn!("Calibration page CRC mismatch: factory trims may be unreliable");
+                }
+                *self.cal_page.lock().await = Some(page);
+            }
+            Err(e) => info!(
+                "Calibration page not loaded ({}); using range model only",
+                e
+            ),
+        }
+
+        // Force the safe max-headroom input range (42 dBV) on every connect, like
+        // the official app: a live signal already present at plug-in can't overload
+        // a too-sensitive range. This is deliberately NOT a restore of the previous
+        // range — the vendor re-forces 42 dBV on every (re)connect (verified in
+        // our USB captures). set_input_gain is
+        // idempotent, so this no-ops if the device already booted to 42.
+        self.set_input_gain(InputGain::Gain42dBV).await?;
+
+        Ok(())
+    }
+
+    /// Compute the dB offset that converts our uncalibrated digital transfer
+    /// function into a real voltage gain, for the given input channel and the
+    /// driven output channel.
+    ///
+    /// Derived from the PyQa40x volts↔digital conversion (no empirical
+    /// constant). For a loopback `v_in = v_out`, equating the DAC and ADC
+    /// conversions gives:
+    ///
+    /// ```text
+    /// gain_cal = gain_digital + cal_adc_dB + cal_dac_dB + inFS - outFS - 9
+    /// ```
+    ///
+    /// where the `9` dB = `3` (dBFS is peak, dBV is RMS → sine √2) on the DAC
+    /// plus `6` (differential input → factor 2) on the ADC; `cal_adc_dB`/
+    /// `cal_dac_dB` are the factory per-range/channel trims read from the
+    /// device. Hardware-validated: a resistive loopback reads ~0 dB across all
+    /// ranges. Falls back to nominal cal values when the page is unavailable.
+    pub async fn fr_calibration_offset(&self, input_ch: Channel, output_ch: Channel) -> f32 {
+        // Reference-convention constants (see doc): peak↔RMS on the DAC and
+        // single-ended↔differential on the ADC.
+        const DAC_PEAK_TO_RMS_DB: f32 = 3.0;
+        const ADC_DIFFERENTIAL_DB: f32 = 6.0;
+        const CONVENTION_DB: f32 = DAC_PEAK_TO_RMS_DB + ADC_DIFFERENTIAL_DB; // 9 dB
+
+        let cfg = self.config.lock().await.clone();
+        let in_fs = cfg.input_gain.as_dbv() as f32;
+        let out_fs = cfg.output_gain.as_dbv() as f32;
+
+        let page_db = |page: &[u8], off: usize| -> Option<f32> {
+            if off + 6 <= page.len() {
+                let v = f32::from_le_bytes([
+                    page[off + 2],
+                    page[off + 3],
+                    page[off + 4],
+                    page[off + 5],
+                ]);
+                if v.is_finite() && v.abs() < 40.0 {
+                    Some(v)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let ch_off = |base: Option<usize>, ch: Channel| -> Option<usize> {
+            base.map(|o| if ch == Channel::Right { o + 6 } else { o })
+        };
+
+        // Nominal factory trims (used when the page could not be read); close to
+        // the measured values so the fallback is still within a few tenths dB.
+        let (mut adc_cal, mut dac_cal) = (8.75_f32, -0.3_f32);
+        if let Some(page) = self.cal_page.lock().await.as_ref() {
+            if let Some(a) = ch_off(
+                CalibrationData::adc_offset(cfg.input_gain.as_dbv()),
+                input_ch,
+            )
+            .and_then(|o| page_db(page, o))
+            {
+                adc_cal = a;
+            }
+            if let Some(d) = ch_off(
+                CalibrationData::dac_offset(cfg.output_gain.as_dbv()),
+                output_ch,
+            )
+            .and_then(|o| page_db(page, o))
+            {
+                dac_cal = d;
+            }
+        }
+
+        in_fs - out_fs - CONVENTION_DB + adc_cal + dac_cal
+    }
+
+    /// Disconnect from the device
+    pub async fn disconnect(&self) -> Result<()> {
+        // Leave the device in a safe state for the next plug-in: force the safe
+        // 42 dBV max-headroom input range (same range the app forces on connect),
+        // so a signal present at the next connection can't overload a sensitive
+        // range. Best-effort — must not block tearing down the connection.
+        let _ = self.set_input_gain(InputGain::Gain42dBV).await;
+        // Best-effort: stop any active streaming so we don't leave the device
+        // wedged in RUN state for the next session.
+        let _ = self
+            .write_register(
+                registers::STREAM_CTRL,
+                &registers::STREAM_STOP.to_be_bytes(),
+            )
+            .await;
+        // Front-panel I2S off too (issue #71 review MUST-FIX #2): the
+        // engine's own stop is best-effort behind a busy device, so the
+        // safe-state teardown is the backstop that never leaves the port
+        // asserted for the next session.
+        let _ = self
+            .write_register(registers::I2S_CTRL, &0u32.to_be_bytes())
+            .await;
+        // Drop endpoints (they hold refs to the interface) before the interface.
+        *self.i2s_ep.lock().await = None;
+        *self.eps.lock().await = None;
+        self.release_virtual_import().await;
+        *self.interface.lock().await = None;
+        *self.device.lock().await = None;
+        *self.meta.lock().await = None;
+        *self.model.lock().await = None;
+        info!("Disconnected from QA40x");
+        Ok(())
+    }
+
+    /// Check if device is connected (logical state). The endpoints are the
+    /// authority: a real connection also holds an interface, the virtual one
+    /// (demo mode) only holds endpoints.
+    pub async fn is_connected(&self) -> bool {
+        self.eps.lock().await.is_some()
+    }
+
+    /// Device identity (firmware version + serial + product), read at connect.
+    /// `None` until connected.
+    pub async fn device_meta(&self) -> Option<DeviceMeta> {
+        self.meta.lock().await.clone()
+    }
+
+    /// The detected model (QA402/QA403), set at connect. `None` until connected.
+    pub async fn model(&self) -> Option<Model> {
+        *self.model.lock().await
+    }
+
+    /// Size of the factory calibration page read at connect, or `None` when
+    /// the page could not be loaded (the nominal range model is then in
+    /// use). Additive getter for the capability record's calibration source
+    /// (issue #25 lot B) — the page itself stays private.
+    pub async fn factory_calibration_page_len(&self) -> Option<usize> {
+        self.cal_page.lock().await.as_ref().map(Vec::len)
+    }
+
+    /// Enter the NXP DFU bootloader: write register 0x0F = 0xDEADBEEF then
+    /// 0xCAFEBABE (the two-magic unlock seen in the official app's USB capture).
+    /// The device then resets and re-enumerates as the NXP bootloader
+    /// (0x1FC9:0x0022). **DEVICE-MUTATING** — only call as part of a confirmed
+    /// firmware flash, never automatically.
+    pub async fn enter_bootloader(&self) -> Result<()> {
+        self.write_register(registers::BOOTLOADER_ENTRY, &0xDEAD_BEEFu32.to_be_bytes())
+            .await?;
+        self.write_register(registers::BOOTLOADER_ENTRY, &0xCAFE_BABEu32.to_be_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// Release the USB claim and clear cached state WITHOUT any device I/O — used
+    /// right after `enter_bootloader`, when the unit is detaching to re-enumerate
+    /// as the NXP bootloader (a normal disconnect() would try to write registers
+    /// to a device that is already going away).
+    pub async fn mark_disconnected(&self) {
+        *self.i2s_ep.lock().await = None;
+        *self.eps.lock().await = None;
+        self.release_virtual_import().await;
+        *self.interface.lock().await = None;
+        *self.device.lock().await = None;
+        *self.meta.lock().await = None;
+        *self.model.lock().await = None;
+    }
+
+    /// One keepalive cycle, mirroring the official app: write the link register
+    /// (0x00) with a pattern, then read telemetry. Runs ~1 s while connected and
+    /// idle (frontend poll) to hold the LINK LED lit, and between stream frames
+    /// during a run (see `run_keepalive_if_due`). During a capture the
+    /// pump fires the same cycle inline on the endpoints it already holds
+    /// (`pump_keepalive_if_due`) — interleaving register I/O with an
+    /// active stream is hardware-supported: the official app keepalives at
+    /// ~1 Hz even while measuring (issue #54; the earlier "keepalive wedges
+    /// the stream" finding was actually undrained cancelled completions, see
+    /// `stream_pump`).
+    pub async fn keepalive(&self) -> Result<Telemetry> {
+        let t = {
+            let mut guard = self.eps.lock().await;
+            let eps = guard.as_mut().ok_or(QA40xError::DeviceNotOpened)?;
+            keepalive_on(eps).await?
+        };
+        *self.last_keepalive.lock().await = Some(std::time::Instant::now());
+        *self.cached_telemetry.lock().await = Some(t.clone());
+        self.keepalive_ok
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(t)
+    }
+
+    /// When the most recent LINK keepalive was ATTEMPTED (idle poll,
+    /// between-frame or in-capture), if any — the rate-limit stamp, taken
+    /// before the cycle runs. For validation use
+    /// [`Self::keepalive_ok_count`], which only counts completed cycles.
+    pub async fn last_keepalive_at(&self) -> Option<std::time::Instant> {
+        *self.last_keepalive.lock().await
+    }
+
+    /// COMPLETED keepalive cycles since construction, across every path
+    /// (idle poll, between-frame, in-capture). Diagnostics —
+    /// `examples/hw_run_keepalive.rs` asserts on the delta across one long
+    /// capture, which the attempt stamp alone cannot prove (issue #54).
+    pub fn keepalive_ok_count(&self) -> u64 {
+        self.keepalive_ok.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Telemetry from the most recent keepalive (idle poll or in-run), with no
+    /// USB I/O — safe for the UI to poll while a run owns the stream.
+    pub async fn last_telemetry(&self) -> Option<Telemetry> {
+        self.cached_telemetry.lock().await.clone()
+    }
+
+    /// The shared telemetry cache cell itself. Grab it ONCE at construction so
+    /// pure cache readers (the UI's in-run telemetry poll) can read it WITHOUT
+    /// the exclusive device mutex: queuing a once-per-second reader on that
+    /// mutex during a long capture is what fed the quit-hang's lock convoy.
+    pub fn telemetry_cell(&self) -> Arc<Mutex<Option<Telemetry>>> {
+        self.cached_telemetry.clone()
+    }
+
+    /// The front-panel I2S OUT endpoint cell itself (issue #71). Grab it ONCE
+    /// at runtime construction — the `telemetry_cell` pattern: the I2S writer
+    /// must reach its endpoint WITHOUT the exclusive device mutex, or a 22 s
+    /// capture would starve the paced I2S stream (and §10 forbids serializing
+    /// the endpoints behind each other).
+    pub fn i2s_endpoint_cell(&self) -> Arc<Mutex<Option<BulkOut>>> {
+        self.i2s_ep.clone()
+    }
+
+    /// Whether the front-panel I2S OUT endpoint was claimed on this
+    /// connection (false when disconnected or the claim failed).
+    pub async fn i2s_available(&self) -> bool {
+        self.i2s_ep.lock().await.is_some()
+    }
+
+    /// Write the I2S frame width (register 0x0B). The vendor app pauses
+    /// ~100 ms between this and `I2S_CTRL = 1`; that pause is the CALLER's
+    /// (the engine's) so the device mutex is not held across a sleep.
+    pub async fn set_i2s_width(&self, width: I2sWidth) -> Result<()> {
+        self.write_register(registers::I2S_WIDTH, &width.register_value().to_be_bytes())
+            .await
+    }
+
+    /// Start (`true`) or stop (`false`) the front-panel I2S stream
+    /// (register 0x0A). Samples then flow on bulk EP 0x03.
+    pub async fn set_i2s_running(&self, on: bool) -> Result<()> {
+        self.write_register(registers::I2S_CTRL, &u32::from(on).to_be_bytes())
+            .await
+    }
+
+    /// Rate limiter shared by the between-stream and in-capture keepalives:
+    /// true — and the timestamp is taken — if no keepalive ran within the
+    /// last ~1 s. Stamps BEFORE the attempt so a failing device is pinged at
+    /// most once a second, not once per frame/block.
+    async fn take_keepalive_slot(&self) -> bool {
+        let mut last = self.last_keepalive.lock().await;
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Fire a LINK-LED keepalive if none ran within the last ~1 s. Called from
+    /// [`Self::stream_io`] before each stream, so multi-frame runs (live
+    /// analyzer, sweeps, the looping output generator) keep the LINK LED lit
+    /// between captures; DURING a capture the pump takes over with
+    /// [`Self::pump_keepalive_if_due`] (issue #54).
+    /// Non-fatal by design: an LED ping must never fail a measurement.
+    async fn run_keepalive_if_due(&self) {
+        if !self.take_keepalive_slot().await {
+            return;
+        }
+        if let Err(e) = self.keepalive().await {
+            debug!("in-run keepalive skipped: {}", e);
+        }
+    }
+
+    /// In-capture LINK keepalive (issue #54): the same cycle as
+    /// [`Self::keepalive`], fired at most once per second from the pump's
+    /// collection loop on the endpoints the pump already holds. With a long
+    /// FFT a single capture runs for tens of seconds, and without this the
+    /// LINK LED times out mid-capture. Register I/O rides its own bulk
+    /// endpoints, distinct from the data pair, and the official app does
+    /// exactly this (its USB traces show 0x00 writes inside armed
+    /// STREAM_CTRL=5 windows). Serialization with all other register I/O is
+    /// structural: the pump owns the endpoint mutex for the whole capture.
+    ///
+    /// Non-fatal by design: an LED ping must never fail a measurement.
+    /// Returns false after a failed cycle so the caller stops pinging for the
+    /// REST of this capture — a register path that stalls under an armed
+    /// stream should not be hammered once a second (each failure costs its
+    /// timeouts and risks reply desync); the between-frame keepalive probes
+    /// it again after STREAM_STOP.
+    async fn pump_keepalive_if_due(&self, eps: &mut ClaimedEndpoints) -> bool {
+        if !self.take_keepalive_slot().await {
+            return true;
+        }
+        match keepalive_on(eps).await {
+            Ok(t) => {
+                // Re-stamp on completion so the cadence matches keepalive()
+                // (~1 s between cycle ends, not between attempt starts).
+                *self.last_keepalive.lock().await = Some(std::time::Instant::now());
+                *self.cached_telemetry.lock().await = Some(t);
+                self.keepalive_ok
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "in-capture keepalive failed ({}); disabled until the capture ends",
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Read live hardware telemetry (USB voltage/current, ISO current,
+    /// temperature) from the sensor registers. Reads are non-destructive; the
+    /// caller should avoid polling this mid-stream (it queues on the endpoint
+    /// mutex until the capture ends — poll [`Self::last_telemetry`] instead,
+    /// which the in-capture keepalive refreshes at ~1 Hz).
+    pub async fn read_telemetry(&self) -> Result<Telemetry> {
+        let mut guard = self.eps.lock().await;
+        let eps = guard.as_mut().ok_or(QA40xError::DeviceNotOpened)?;
+        telemetry_on(eps).await
+    }
+
+    /// Whether a QA40x (QA402 or QA403) is present on the USB bus, regardless of whether we are
+    /// connected to it. Used for auto-connect. The virtual device (demo mode)
+    /// is "present" while attached — it lives in-process, not on the bus.
+    pub async fn is_present(&self) -> bool {
+        if self.is_virtual() {
+            return true;
+        }
+        self.is_hardware_present().await
+    }
+
+    /// Whether REAL hardware is on the USB bus — never satisfied by the
+    /// virtual device. The frontend polls this during a demo session to hand
+    /// over to a QA40x the moment one is plugged in.
+    pub async fn is_hardware_present(&self) -> bool {
+        crate::discovery::usb::any_unit_present().await
+    }
+
+    /// Check if device is still physically connected by looking for it in USB
+    /// device list. NOTE: "any QA40x on the bus", not per-unit — the liveness
+    /// monitor no longer uses this (issue #25 lot E: it probes the open
+    /// unit's own bus position via `device::usb::unit_present_at`, without
+    /// the device mutex); this remains for the virtual path and the
+    /// integration tests.
+    pub async fn check_physical_connection(&self) -> bool {
+        // If not logically connected, return false immediately
+        if !self.is_connected().await {
+            return false;
+        }
+
+        // The virtual device never unplugs: it is attached until disconnect().
+        if self.is_virtual() {
+            return true;
+        }
+
+        // Any QA40x on the bus — the pre-registry predicate, kept for this
+        // legacy entry point (per-unit presence lives in
+        // `device::usb::unit_present_at`, used by the liveness monitor).
+        let device_found = crate::discovery::usb::any_unit_present().await;
+
+        if !device_found {
+            debug!("Device no longer present in USB device list");
+            // Clean up the internal state
+            *self.i2s_ep.lock().await = None;
+            *self.eps.lock().await = None;
+            *self.interface.lock().await = None;
+            *self.device.lock().await = None;
+            return false;
+        }
+
+        true
+    }
+
+    /// Verify connection by writing and reading back a random value to register 0
+    async fn verify_connection(&self) -> Result<()> {
+        info!("Verifying connection to QA40x");
+
+        // Generate a random u32 value in a separate scope to drop the RNG before await
+        let random_value: u32 = crate::nonce::connection_nonce();
+
+        debug!(
+            "Writing random test value 0x{:08X} to register 0",
+            random_value
+        );
+
+        // Write the random value to register 0
+        self.write_register(0, &random_value.to_be_bytes()).await?;
+
+        // Small delay to ensure write completes before reading
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Read it back
+        let read_data = self.read_register(0).await?;
+
+        // Check we got 4 bytes back
+        if read_data.len() < 4 {
+            return Err(QA40xError::DeviceError(format!(
+                "Expected 4 bytes from register read, got {}",
+                read_data.len()
+            )));
+        }
+
+        // Convert the read bytes back to u32 (big-endian)
+        let read_value =
+            u32::from_be_bytes([read_data[0], read_data[1], read_data[2], read_data[3]]);
+
+        debug!("Read back value 0x{:08X} from register 0", read_value);
+
+        // Verify they match
+        if read_value == random_value {
+            info!("Connection verification successful: write/read test passed");
+            Ok(())
+        } else {
+            Err(QA40xError::DeviceError(format!(
+                "Connection verification failed: wrote 0x{:08X} but read back 0x{:08X}",
+                random_value, read_value
+            )))
+        }
+    }
+
+    /// Set input gain
+    pub async fn set_input_gain(&self, gain: InputGain) -> Result<()> {
+        // Idempotent: the INPUT_GAIN register drives a mechanical relay, so
+        // writing it clicks even when the value is unchanged. Skip redundant
+        // sets so a repeated config-apply doesn't machine-gun the relay.
+        if self.config.lock().await.input_gain == gain {
+            return Ok(());
+        }
+        info!("Setting input gain to {} dBV", gain.as_dbv());
+        let value = gain.as_register_value();
+        self.write_register(registers::INPUT_GAIN, &value.to_be_bytes())
+            .await?;
+
+        // Stamp the relay settle deadline. No sleep here: the wait is paid by
+        // the next acquisition, in stream_io, between captures.
+        self.relay_settle
+            .lock()
+            .await
+            .stamp(std::time::Instant::now(), RANGE_RELAY_SETTLE);
+
+        let mut config = self.config.lock().await;
+        config.input_gain = gain;
+        Ok(())
+    }
+
+    /// Set output gain
+    pub async fn set_output_gain(&self, gain: OutputGain) -> Result<()> {
+        // Idempotent (see set_input_gain): skip if the relay is already there.
+        if self.config.lock().await.output_gain == gain {
+            return Ok(());
+        }
+        info!("Setting output gain to {} dBV", gain.as_dbv());
+        let value = gain.as_register_value();
+        self.write_register(registers::OUTPUT_GAIN, &value.to_be_bytes())
+            .await?;
+
+        // Stamp the output-relay settle deadline; the next acquisition waits
+        // it out (see set_input_gain).
+        self.relay_settle
+            .lock()
+            .await
+            .stamp(std::time::Instant::now(), RANGE_RELAY_SETTLE);
+
+        let mut config = self.config.lock().await;
+        config.output_gain = gain;
+        Ok(())
+    }
+
+    /// Set sample rate
+    pub async fn set_sample_rate(&self, rate: SampleRate) -> Result<()> {
+        // Reject a rate the connected model doesn't support (384 kHz is QA403-only).
+        if let Some(model) = *self.model.lock().await
+            && !model.supports_rate(rate)
+        {
+            return Err(QA40xError::InvalidValue(format!(
+                "{} does not support {} Hz",
+                model.name(),
+                rate.as_hz()
+            )));
+        }
+        // Idempotent: avoid the register write + 100 ms settle when unchanged.
+        if self.config.lock().await.sample_rate == rate {
+            return Ok(());
+        }
+        info!("Setting sample rate to {} Hz", rate.as_hz());
+        // Register 9 takes an INDEX (0/1/2), not the Hz value. Writing the Hz
+        // value silently leaves the device at 48 kHz because 48000/96000/192000
+        // all share the same low bits.
+        let value = rate.as_register_index();
+        self.write_register(registers::SAMPLE_RATE, &value.to_be_bytes())
+            .await?;
+
+        // Sample rate changes require a delay
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut config = self.config.lock().await;
+        config.sample_rate = rate;
+        Ok(())
+    }
+
+    /// Get current device configuration from memory cache
+    pub async fn get_config(&self) -> DeviceConfig {
+        self.config.lock().await.clone()
+    }
+
+    /// Read input gain from device register
+    pub async fn read_input_gain(&self) -> Result<InputGain> {
+        let data = self.read_register(registers::INPUT_GAIN).await?;
+        if data.len() < 4 {
+            return Err(QA40xError::DeviceError(format!(
+                "Expected 4 bytes from input gain register, got {}",
+                data.len()
+            )));
+        }
+
+        // Convert big-endian bytes to u32 register value
+        let register_value = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+
+        // Map register value to InputGain enum
+        match register_value {
+            0 => Ok(InputGain::Gain0dBV),
+            1 => Ok(InputGain::Gain6dBV),
+            2 => Ok(InputGain::Gain12dBV),
+            3 => Ok(InputGain::Gain18dBV),
+            4 => Ok(InputGain::Gain24dBV),
+            5 => Ok(InputGain::Gain30dBV),
+            6 => Ok(InputGain::Gain36dBV),
+            7 => Ok(InputGain::Gain42dBV),
+            _ => Err(QA40xError::DeviceError(format!(
+                "Invalid input gain register value: {}",
+                register_value
+            ))),
+        }
+    }
+
+    /// Read output gain from device register
+    pub async fn read_output_gain(&self) -> Result<OutputGain> {
+        let data = self.read_register(registers::OUTPUT_GAIN).await?;
+        if data.len() < 4 {
+            return Err(QA40xError::DeviceError(format!(
+                "Expected 4 bytes from output gain register, got {}",
+                data.len()
+            )));
+        }
+
+        // Convert big-endian bytes to u32 register value
+        let register_value = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+
+        // Map register value to OutputGain enum
+        match register_value {
+            0 => Ok(OutputGain::GainMinus12dBV),
+            1 => Ok(OutputGain::GainMinus2dBV),
+            2 => Ok(OutputGain::Gain8dBV),
+            3 => Ok(OutputGain::Gain18dBV),
+            _ => Err(QA40xError::DeviceError(format!(
+                "Invalid output gain register value: {}",
+                register_value
+            ))),
+        }
+    }
+
+    /// Read sample rate from device register
+    pub async fn read_sample_rate(&self) -> Result<SampleRate> {
+        let data = self.read_register(registers::SAMPLE_RATE).await?;
+        if data.len() < 4 {
+            return Err(QA40xError::DeviceError(format!(
+                "Expected 4 bytes from sample rate register, got {}",
+                data.len()
+            )));
+        }
+
+        // Register 9 returns the sample-rate index (0/1/2). Accept a raw Hz
+        // value too, in case a device echoes what was written.
+        let raw = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+
+        SampleRate::from_register_value(raw).ok_or_else(|| {
+            QA40xError::DeviceError(format!("Invalid sample rate register value: {}", raw))
+        })
+    }
+
+    /// Read current device configuration from hardware registers
+    pub async fn read_config_from_device(&self) -> Result<DeviceConfig> {
+        info!("Reading configuration from device registers");
+
+        let input_gain = self.read_input_gain().await?;
+        let output_gain = self.read_output_gain().await?;
+        let sample_rate = self.read_sample_rate().await?;
+
+        let config = DeviceConfig {
+            input_gain,
+            output_gain,
+            sample_rate,
+        };
+
+        debug!(
+            "Read config from device: input={} dBV, output={} dBV, rate={} Hz",
+            config.input_gain.as_dbv(),
+            config.output_gain.as_dbv(),
+            config.sample_rate.as_hz()
+        );
+
+        // Update cached config
+        *self.config.lock().await = config.clone();
+
+        Ok(config)
+    }
+
+    /// Read the 512-byte factory calibration page and extract the correction
+    /// factors for the currently configured input/output full scale.
+    ///
+    /// Protocol (per PyQa40x): write 0x10 to register 0x0D to select the cal
+    /// page, then read register 0x19 128 times; each read returns the next
+    /// 4 bytes (little-endian) of the page. Records are 6 bytes: an int16 level
+    /// followed by a float32 dB correction; the right channel record sits 6
+    /// bytes after the left.
+    /// Read the raw 512-byte factory calibration page from the device.
+    pub async fn read_calibration_page(&self) -> Result<Vec<u8>> {
+        info!("Reading calibration page");
+
+        // Select flash page 0 (0x10 + 2*page) — the factory calibration page.
+        self.write_register(registers::PAGE_SELECT, &0x10u32.to_be_bytes())
+            .await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Read the 512-byte page, 4 bytes at a time, little-endian.
+        let mut page = Vec::with_capacity(512);
+        for _ in 0..128 {
+            let data = self.read_register(registers::CALIBRATION).await?;
+            if data.len() < 4 {
+                return Err(QA40xError::InvalidValue(
+                    "Calibration read returned fewer than 4 bytes".to_string(),
+                ));
+            }
+            // The register read decodes big-endian; re-emit the raw 4 bytes in
+            // little-endian page order.
+            let val = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+            page.extend_from_slice(&val.to_le_bytes());
+        }
+        Ok(page)
+    }
+
+    pub async fn read_calibration(&self) -> Result<CalibrationData> {
+        let page = self.read_calibration_page().await?;
+
+        let cfg = self.config.lock().await.clone();
+        let read_db = |offset: usize| -> Option<f32> {
+            // Skip the int16 level, read the float32 dB correction.
+            let p = offset + 2;
+            if p + 4 <= page.len() {
+                Some(f32::from_le_bytes([
+                    page[p],
+                    page[p + 1],
+                    page[p + 2],
+                    page[p + 3],
+                ]))
+            } else {
+                None
+            }
+        };
+
+        let adc_off = CalibrationData::adc_offset(cfg.input_gain.as_dbv());
+        let dac_off = CalibrationData::dac_offset(cfg.output_gain.as_dbv());
+
+        let mut cal = CalibrationData::default();
+        let mut valid = true;
+        if let Some(off) = adc_off {
+            match (read_db(off), read_db(off + 6)) {
+                (Some(l), Some(r))
+                    if l.is_finite() && r.is_finite() && l.abs() < 20.0 && r.abs() < 20.0 =>
+                {
+                    cal.adc_cal_left = CalibrationData::db_to_linear(l);
+                    cal.adc_cal_right = CalibrationData::db_to_linear(r);
+                }
+                _ => valid = false,
+            }
+        } else {
+            valid = false;
+        }
+        if let Some(off) = dac_off {
+            match (read_db(off), read_db(off + 6)) {
+                (Some(l), Some(r))
+                    if l.is_finite() && r.is_finite() && l.abs() < 20.0 && r.abs() < 20.0 =>
+                {
+                    cal.dac_cal_left = CalibrationData::db_to_linear(l);
+                    cal.dac_cal_right = CalibrationData::db_to_linear(r);
+                }
+                _ => valid = false,
+            }
+        } else {
+            valid = false;
+        }
+        cal.valid = valid;
+
+        debug!(
+            "Calibration (valid={}): ADC L={:.4} R={:.4}, DAC L={:.4} R={:.4}",
+            cal.valid, cal.adc_cal_left, cal.adc_cal_right, cal.dac_cal_left, cal.dac_cal_right
+        );
+        Ok(cal)
+    }
+
+    /// USB bulk transfer size used for all streaming (matches PyQa40x).
+    const USB_BUF_SIZE: usize = 16384;
+
+    /// Encode stereo f32 samples into the interleaved int32 little-endian byte
+    /// stream the DAC expects. L/R are swapped on the wire on the QA402/QA403,
+    /// so the caller's "left" is placed in the right slot and vice versa.
+    fn encode_stereo(left: &[f32], right: &[f32]) -> Vec<u8> {
+        let n = left.len().min(right.len());
+        let mut buf = Vec::with_capacity(n * 8);
+        const FS: f32 = 2_147_483_647.0; // 2^31 - 1
+        for i in 0..n {
+            let l = (left[i].clamp(-1.0, 1.0) * FS) as i32;
+            let r = (right[i].clamp(-1.0, 1.0) * FS) as i32;
+            // Wire order is swapped: right sample first, then left.
+            buf.extend_from_slice(&r.to_le_bytes());
+            buf.extend_from_slice(&l.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Decode the ADC byte stream (interleaved int32 LE, L/R swapped on the
+    /// wire) back into normalized f32 left/right channels.
+    fn decode_stereo(bytes: &[u8], max_samples: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut left = Vec::with_capacity(max_samples);
+        let mut right = Vec::with_capacity(max_samples);
+        const FS: f32 = 2_147_483_648.0; // 2^31
+        let mut i = 0;
+        while i + 8 <= bytes.len() && left.len() < max_samples {
+            // Wire order is swapped: first 4 bytes are the right channel.
+            let r = i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+            let l = i32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]);
+            left.push(l as f32 / FS);
+            right.push(r as f32 / FS);
+            i += 8;
+        }
+        (left, right)
+    }
+
+    /// Run one synchronized DAC-write / ADC-read stream.
+    ///
+    /// `tx` is the full interleaved byte stream to send to the DAC. Returns the
+    /// captured ADC byte stream. Implements the "prime the pump" protocol: two
+    /// reads and two writes are queued up front, then each completed read is
+    /// immediately followed by another write so the hardware never stalls.
+    ///
+    /// Streaming is always stopped afterwards, including on error paths.
+    async fn stream_io(&self, tx: &[u8]) -> Result<Vec<u8>> {
+        self.stream_io_cancellable(tx, None).await
+    }
+
+    /// [`stream_io`] with a cooperative cancel flag: checked between block
+    /// reads by the pump; on cancel the stream closes through the SAME
+    /// STREAM_STOP + cancel_and_drain path as an error — the transaction is
+    /// simply not retried and returns [`QA40xError::Cancelled`].
+    async fn stream_io_cancellable(
+        &self,
+        tx: &[u8],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<u8>> {
+        const BUF: usize = QA40xDevice::USB_BUF_SIZE;
+        let total_bytes = tx.len();
+        let blocks = total_bytes.div_ceil(BUF).max(2);
+
+        debug!("stream_io: {} bytes in {} blocks", total_bytes, blocks);
+
+        // Keep the LINK LED lit across multi-frame runs: at most one keepalive
+        // per second. This pre-stream ping covers the gaps between captures;
+        // during the capture itself the pump keeps pinging inline at the same
+        // ~1 Hz (issue #54). Hardware-validated by hw_run_keepalive.
+        self.run_keepalive_if_due().await;
+
+        // Range relays: if reg 5/6 was written since the last capture, wait
+        // out the remaining settle BEFORE starting the stream. The wait lives
+        // here — between captures, never interleaved into one — and several
+        // range writes collapse into a single wait (the deadline is the max,
+        // not the sum). Runs after the keepalive so that register I/O counts
+        // toward the settle window instead of adding to it.
+        let remaining = self
+            .relay_settle
+            .lock()
+            .await
+            .remaining(std::time::Instant::now());
+        if let Some(wait) = remaining {
+            debug!("Waiting {} ms for range relays to settle", wait.as_millis());
+            tokio::time::sleep(wait).await;
+        }
+
+        // A cold stream occasionally stalls on the very first transfer, which
+        // then wedges the endpoints. Retry once, fully quiescing the device in
+        // between so the second attempt starts clean.
+        const MAX_ATTEMPTS: usize = 2;
+        let mut last_err = QA40xError::Timeout;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            // Start streaming, then give the engine a moment to spin up before
+            // submitting transfers (avoids the cold-start read timeout).
+            self.write_register(
+                registers::STREAM_CTRL,
+                &registers::STREAM_START.to_be_bytes(),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+
+            let result = self.stream_pump(tx, blocks, cancel).await;
+
+            // On failure, clear the data endpoints so a stalled transfer does
+            // not wedge the retry (or the next operation).
+            if result.is_err()
+                && let Some(eps) = self.eps.lock().await.as_mut()
+            {
+                let _ = eps.data_write.clear_halt().await;
+                let _ = eps.data_read.clear_halt().await;
+            }
+
+            // Always stop streaming between attempts and on the way out.
+            let _ = self
+                .write_register(
+                    registers::STREAM_CTRL,
+                    &registers::STREAM_STOP.to_be_bytes(),
+                )
+                .await;
+
+            match result {
+                Ok(rx) => return Ok(rx),
+                // User cancel: the stream is already stopped and drained —
+                // return immediately, a retry would replay the whole capture.
+                Err(QA40xError::Cancelled) => return Err(QA40xError::Cancelled),
+                Err(e) => {
+                    debug!("stream_io attempt {} failed: {}", attempt + 1, e);
+                    last_err = e;
+                    // Let cancelled transfers fully drain before retrying so the
+                    // fresh queue does not collide with lingering ones.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// Inner pump loop for [`stream_io`]. Kept separate so the caller can
+    /// guarantee streaming is stopped regardless of how this returns.
+    async fn stream_pump(
+        &self,
+        tx: &[u8],
+        blocks: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<u8>> {
+        const BUF: usize = QA40xDevice::USB_BUF_SIZE;
+        let total_bytes = tx.len();
+
+        let chunk = |idx: usize| -> Vec<u8> {
+            let start = idx * BUF;
+            if start >= total_bytes {
+                vec![0u8; BUF]
+            } else {
+                let end = (start + BUF).min(total_bytes);
+                let mut c = tx[start..end].to_vec();
+                if c.len() < BUF {
+                    c.resize(BUF, 0);
+                }
+                c
+            }
+        };
+
+        let mut guard = self.eps.lock().await;
+        let eps = guard.as_mut().ok_or(QA40xError::DeviceNotOpened)?;
+
+        // Pre-queue every read and write up front (the QA40xPlot approach). With
+        // all ADC reads already submitted before data flows, there is no
+        // cold-start race where the first read times out, and the DAC never
+        // underruns waiting for the host to submit the next write. Each endpoint
+        // keeps its own FIFO queue; next_complete() returns them in submission
+        // order. Interleave read/write submission per block so the device sees
+        // paired transfers.
+        for i in 0..blocks {
+            eps.data_read.submit(Buffer::new(BUF));
+            eps.data_write.submit(chunk(i).into());
+        }
+
+        let result = self.pump_collect(eps, blocks, total_bytes, cancel).await;
+
+        // On any failure, cancel and FULLY drain both data endpoints. Draining
+        // matters as much as cancelling: nusb keeps completed-but-uncollected
+        // transfers queued per endpoint, so any stale cancelled completion left
+        // behind here would be returned to the NEXT stream's next_complete() and
+        // fail it with "transfer was cancelled" — that poisoning is what made
+        // every capture after a failure fail (hw_run_keepalive, ~2 ok/28 err).
+        if result.is_err() {
+            cancel_and_drain(&mut eps.data_read).await;
+            cancel_and_drain(&mut eps.data_write).await;
+        }
+
+        result
+    }
+
+    /// Collection half of [`stream_pump`]: gather every queued ADC read in
+    /// order, then confirm every DAC write. Kept separate so the caller has a
+    /// single error path on which it can cancel + drain both data endpoints.
+    async fn pump_collect(
+        &self,
+        eps: &mut ClaimedEndpoints,
+        blocks: usize,
+        capacity: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<u8>> {
+        let mut rx = Vec::with_capacity(capacity);
+        let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
+        let mut keepalive_enabled = true;
+
+        // Collect ADC data in order. A generous timeout covers the whole queue
+        // draining at the sample rate.
+        for i in 0..blocks {
+            // Cooperative cancel between blocks (a long batched sweep is ONE
+            // stream — this is the only mid-transaction exit): returning Err
+            // rides the caller's cancel_and_drain + STREAM_STOP path.
+            if cancelled() {
+                debug!("stream_pump: cancelled at block {}/{}", i, blocks);
+                return Err(QA40xError::Cancelled);
+            }
+            // In-capture LINK keepalive (~1 Hz, issue #54). Every data
+            // transfer is already queued on both endpoints, so a
+            // millisecond-scale register round-trip between collections
+            // never starves the stream. Re-check cancel afterwards: a
+            // FAILING keepalive can take ~1.5 s of register timeouts, and
+            // the flag must not wait out the next 5 s data read on top.
+            if keepalive_enabled {
+                keepalive_enabled = self.pump_keepalive_if_due(eps).await;
+                if cancelled() {
+                    debug!(
+                        "stream_pump: cancelled at block {}/{} (post-keepalive)",
+                        i, blocks
+                    );
+                    return Err(QA40xError::Cancelled);
+                }
+            }
+            match complete_or_cancel(&mut eps.data_read, Duration::from_secs(5)).await {
+                Ok(c) => {
+                    c.status.map_err(QA40xError::from)?;
+                    rx.extend_from_slice(&c.buffer[..]);
+                }
+                Err(e) => {
+                    debug!("stream_pump: read stalled at block {}/{}", i, blocks);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Confirm all DAC writes completed.
+        for _ in 0..blocks {
+            complete_or_cancel(&mut eps.data_write, Duration::from_secs(5))
+                .await?
+                .status
+                .map_err(QA40xError::from)?;
+        }
+
+        Ok(rx)
+    }
+
+    /// Acquire audio data from the device
+    ///
+    /// The QA40x requires synchronized DAC write + ADC read operations.
+    /// For acquisition-only mode, we send zeros to the DAC.
+    pub async fn acquire_data(&self, num_samples: usize) -> Result<AudioData> {
+        info!("Acquiring {} samples", num_samples);
+
+        // Discard the first blocks worth of ADC data: after the stream starts,
+        // the hardware pipeline is still filling and the initial samples are
+        // stale. Capturing extra and dropping the lead-in keeps the returned
+        // block clean.
+        const LEADIN_SAMPLES: usize = 4096;
+        let capture_samples = num_samples + LEADIN_SAMPLES;
+
+        // Silence on the DAC while we read the ADC.
+        let tx = vec![0u8; capture_samples * 8];
+        let rx = self.stream_io(&tx).await?;
+
+        let (mut left, mut right) = Self::decode_stereo(&rx, capture_samples);
+        // Drop the lead-in.
+        let drop = LEADIN_SAMPLES.min(left.len());
+        left.drain(0..drop);
+        right.drain(0..drop);
+        left.truncate(num_samples);
+        right.truncate(num_samples);
+
+        debug!("Acquired {} samples per channel", left.len());
+
+        let config = self.config.lock().await;
+        Ok(AudioData {
+            left_channel: left,
+            right_channel: right,
+            sample_rate: config.sample_rate.as_hz(),
+        })
+    }
+
+    /// Generate output signal (DAC)
+    ///
+    /// The QA40x requires synchronized DAC write + ADC read operations.
+    /// For output-only mode, we still need to read from ADC (data is discarded).
+    pub async fn generate_signal(&self, left: &[f32], right: &[f32]) -> Result<()> {
+        if left.len() != right.len() {
+            return Err(QA40xError::InvalidValue(
+                "Left and right channel lengths must match".to_string(),
+            ));
+        }
+
+        info!("Generating signal with {} samples", left.len());
+
+        let tx = Self::encode_stereo(left, right);
+        let _ = self.stream_io(&tx).await?;
+
+        debug!("Signal generation complete");
+        Ok(())
+    }
+
+    /// Output a signal on the DAC while simultaneously capturing the ADC input.
+    ///
+    /// Unlike [`Self::generate_signal`], which discards the captured input, this
+    /// returns the recorded audio — so a generated tone can be analysed through
+    /// a loopback (fundamental + harmonics + THD). A short lead-in of silence is
+    /// prepended and dropped so the returned block is past the pipeline warm-up.
+    pub async fn generate_and_capture(&self, left: &[f32], right: &[f32]) -> Result<AudioData> {
+        self.generate_and_capture_cancellable(left, right, None)
+            .await
+    }
+
+    /// [`Self::generate_and_capture`] with a cooperative cancel flag — for LONG
+    /// single-stream transactions (the batched THD sweep) that a user must be
+    /// able to abort mid-capture. Returns [`QA40xError::Cancelled`]; the
+    /// device is left cleanly stopped (same STREAM_STOP + drain exit as an
+    /// error, without the retry).
+    pub async fn generate_and_capture_cancellable(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<AudioData> {
+        if left.len() != right.len() {
+            return Err(QA40xError::InvalidValue(
+                "Left and right channel lengths must match".to_string(),
+            ));
+        }
+        let num_samples = left.len();
+        info!("Generate-and-capture with {} samples", num_samples);
+
+        // Prepend silence so the captured, latency-shifted signal is fully
+        // inside the returned window.
+        const LEADIN_SAMPLES: usize = 4096;
+        let mut l = vec![0.0f32; LEADIN_SAMPLES];
+        l.extend_from_slice(left);
+        let mut r = vec![0.0f32; LEADIN_SAMPLES];
+        r.extend_from_slice(right);
+
+        let tx = Self::encode_stereo(&l, &r);
+        let rx = self.stream_io_cancellable(&tx, cancel).await?;
+
+        let total = LEADIN_SAMPLES + num_samples;
+        let (mut cl, mut cr) = Self::decode_stereo(&rx, total);
+        let drop = LEADIN_SAMPLES.min(cl.len());
+        cl.drain(0..drop);
+        cr.drain(0..drop);
+        cl.truncate(num_samples);
+        cr.truncate(num_samples);
+
+        let config = self.config.lock().await;
+        Ok(AudioData {
+            left_channel: cl,
+            right_channel: cr,
+            sample_rate: config.sample_rate.as_hz(),
+        })
+    }
+
+    /// Linear factor converting a full-scale-referenced digital RMS to Vrms for
+    /// the given input channel, from the input full scale and factory ADC cal
+    /// (PyQa40x model: `v = digital · cal_adc · 10^((inFS - 6)/20)`). Returns
+    /// `(factor, calibrated)`; `calibrated=false` (cal assumed 0 dB) if the
+    /// calibration page is unavailable.
+    async fn input_volts_factor(&self, input_ch: Channel) -> (f32, bool) {
+        let cfg = self.config.lock().await.clone();
+        let in_fs = cfg.input_gain.as_dbv() as f32;
+        let base = 10.0f32.powf((in_fs - 6.0) / 20.0);
+
+        if let Some(page) = self.cal_page.lock().await.as_ref() {
+            let base_off = CalibrationData::adc_offset(cfg.input_gain.as_dbv());
+            let off = base_off.map(|o| if input_ch == Channel::Right { o + 6 } else { o });
+            if let Some(o) = off
+                && o + 6 <= page.len()
+            {
+                let db = f32::from_le_bytes([page[o + 2], page[o + 3], page[o + 4], page[o + 5]]);
+                if db.is_finite() && db.abs() < 40.0 {
+                    return (base * 10.0f32.powf(db / 20.0), true);
+                }
+            }
+        }
+        (base, false)
+    }
+
+    /// dB to ADD to a dBFS reading on `input_ch` to obtain absolute dBV, for the
+    /// current input range + factory calibration. Lets the UI display the
+    /// spectrum in dBV instead of dBFS. Returns `(offset_db, calibrated)`.
+    pub async fn input_dbv_offset(&self, input_ch: Channel) -> (f32, bool) {
+        let (factor, calibrated) = self.input_volts_factor(input_ch).await;
+        let offset = if factor > 0.0 {
+            20.0 * factor.log10()
+        } else {
+            0.0
+        };
+        (offset, calibrated)
+    }
+
+    /// Linear factor converting a full-scale-referenced digital RMS on a DAC
+    /// channel to output Vrms, from the output full scale and factory DAC cal
+    /// — the DAC-side mirror of `input_volts_factor`. Two conversions, two
+    /// converters: the input factor moves with reg 5, this one with reg 6.
+    ///
+    /// Base: the output range's dBV is *the RMS of a sine at DAC full scale*
+    /// (digital peak 1.0, digital RMS 1/√2 → 10^(outFS/20) Vrms), so the
+    /// per-unit-digital-RMS factor is `√2 · 10^(outFS/20)`. The factory trim
+    /// for the active output full scale DIVIDES (it is stored in the
+    /// volts→digital direction): that sign is what keeps this factor
+    /// consistent with `fr_calibration_offset` (hardware-validated — a
+    /// resistive loopback FR reads ~0 dB), whose value must equal
+    /// `input_dbv_offset − output_dbv_offset`.
+    async fn output_volts_factor(&self, output_ch: Channel) -> (f32, bool) {
+        let cfg = self.config.lock().await.clone();
+        let base = dac_volts_per_digital_rms(cfg.output_gain.as_dbv() as f32);
+
+        match self.dac_cal_db(output_ch).await {
+            Some(db) => (base / 10.0f32.powf(db / 20.0), true),
+            None => (base, false),
+        }
+    }
+
+    /// Factory DAC trim (dB) for `output_ch` on the CURRENT output range, from
+    /// the calibration page; `None` when the page is unavailable or the record
+    /// does not decode.
+    async fn dac_cal_db(&self, output_ch: Channel) -> Option<f32> {
+        let out_dbv = self.config.lock().await.output_gain.as_dbv();
+        let page_guard = self.cal_page.lock().await;
+        let page = page_guard.as_ref()?;
+        let base_off = CalibrationData::dac_offset(out_dbv)?;
+        let o = if output_ch == Channel::Right {
+            base_off + 6
+        } else {
+            base_off
+        };
+        if o + 6 > page.len() {
+            return None;
+        }
+        let db = f32::from_le_bytes([page[o + 2], page[o + 3], page[o + 4], page[o + 5]]);
+        (db.is_finite() && db.abs() < 40.0).then_some(db)
+    }
+
+    /// Per-channel linear DIGITAL multipliers `(left, right)` that
+    /// pre-compensate the factory DAC trim of the CURRENT output range, so a
+    /// dBV-denominated stimulus lands at the requested voltage at the
+    /// connectors (issue #8: without them the output sits a constant few
+    /// tenths of a dB off — the per-unit trim).
+    ///
+    /// Direction: `output_volts_factor` establishes `volts = digital · base /
+    /// 10^(trim_dB/20)`, so hitting a target voltage takes `digital = ideal ·
+    /// 10^(trim_dB/20)` — the trim MULTIPLIES in the volts→digital direction.
+    /// Returns `((1.0, 1.0), false)` when the calibration page is unavailable
+    /// (the ideal range model, today's behavior).
+    pub async fn dac_trims(&self) -> ((f32, f32), bool) {
+        let l = self.dac_cal_db(Channel::Left).await;
+        let r = self.dac_cal_db(Channel::Right).await;
+        let lin = |db: Option<f32>| db.map_or(1.0, |d| 10.0f32.powf(d / 20.0));
+        ((lin(l), lin(r)), l.is_some() && r.is_some())
+    }
+
+    /// dB to ADD to a dBFS reading of the generated stimulus on `output_ch` to
+    /// obtain the absolute output level in dBV, for the current output range +
+    /// factory calibration — the DAC-side mirror of `input_dbv_offset`. Each
+    /// converter carries its OWN dBFS reference (it moves with that
+    /// converter's range register), so an Output (stimulus) trace must be
+    /// placed on an absolute dBV axis through this offset, never through the
+    /// ADC's (task #51). Returns `(offset_db, calibrated)`.
+    pub async fn output_dbv_offset(&self, output_ch: Channel) -> (f32, bool) {
+        let (factor, calibrated) = self.output_volts_factor(output_ch).await;
+        let offset = if factor > 0.0 {
+            20.0 * factor.log10()
+        } else {
+            0.0
+        };
+        (offset, calibrated)
+    }
+}
+
+/// Await an endpoint's next completion with a timeout. nusb 0.2 decouples
+/// `submit` from completion (unlike 0.1, where dropping the transfer future
+/// cancelled it), so on timeout we cancel the endpoint's queued transfers and
+/// drain every cancellation — otherwise the next submit/collect would pick up a
+/// stale completion.
+pub(crate) async fn complete_or_cancel<T: EndpointQueue>(
+    ep: &mut T,
+    timeout: Duration,
+) -> Result<Completion> {
+    match tokio::time::timeout(timeout, ep.next_complete()).await {
+        Ok(c) => Ok(c),
+        Err(_) => {
+            cancel_and_drain(ep).await;
+            Err(QA40xError::Timeout)
+        }
+    }
+}
+
+/// Cancel every queued transfer on an endpoint and drain ALL the resulting
+/// completions, leaving the endpoint's completion queue empty. Leaving even one
+/// stale (cancelled) completion queued would hand it to the next collector and
+/// fail it with "transfer was cancelled" — see `stream_pump`.
+pub(crate) async fn cancel_and_drain<T: EndpointQueue>(ep: &mut T) {
+    ep.cancel_all();
+    while ep.pending() > 0 {
+        if tokio::time::timeout(Duration::from_millis(500), ep.next_complete())
+            .await
+            .is_err()
+        {
+            debug!(
+                "cancel_and_drain: {} transfers still pending after drain timeout",
+                ep.pending()
+            );
+            break;
+        }
+    }
+}
+
+/// Raw register read against already-claimed endpoints — the core of
+/// [`RegisterOps::read_register`], also callable from the stream pump while it
+/// holds the endpoint mutex (in-capture keepalive, issue #54).
+async fn reg_read_on(eps: &mut ClaimedEndpoints, address: u8) -> Result<Vec<u8>> {
+    debug!(
+        "READ_REGISTER: Starting read from register 0x{:02X}",
+        address
+    );
+
+    // To read a register, write (0x80 | address) + 4 zero bytes on the
+    // register-write endpoint, then read the 4-byte reply on register-read.
+    let read_address = 0x80 | address;
+    let mut cmd = Vec::with_capacity(5);
+    cmd.push(read_address);
+    cmd.extend_from_slice(&[0u8; 4]);
+
+    eps.register_write.submit(cmd.into());
+    complete_or_cancel(&mut eps.register_write, Duration::from_secs(1))
+        .await?
+        .status
+        .map_err(QA40xError::from)?;
+
+    eps.register_read.submit(Buffer::new(512)); // bulk IN needs a multiple of max_packet (512); device short-packets 4 bytes
+    let data = match complete_or_cancel(&mut eps.register_read, Duration::from_secs(1)).await {
+        Ok(c) => c.into_result().map_err(QA40xError::from)?,
+        Err(e) => {
+            // The device may still form the reply after our timeout; left
+            // unconsumed, it would be delivered to the NEXT register read and
+            // shift every subsequent reply one register late for the rest of
+            // the session. One short discard attempt closes that window
+            // (issue #54 review, F4).
+            eps.register_read.submit(Buffer::new(512));
+            if complete_or_cancel(&mut eps.register_read, Duration::from_millis(250))
+                .await
+                .is_ok()
+            {
+                warn!(
+                    "register 0x{:02X}: reply timed out, then arrived late — discarded it to keep the reply stream in sync",
+                    address
+                );
+            }
+            return Err(e);
+        }
+    };
+
+    debug!(
+        "READ_REGISTER: read {} bytes from 0x{:02X}: {:02X?}",
+        data.len(),
+        address,
+        &data[..]
+    );
+    Ok(data.to_vec())
+}
+
+/// Raw register write against already-claimed endpoints — the core of
+/// [`RegisterOps::write_register`], also callable from the stream pump while
+/// it holds the endpoint mutex (in-capture keepalive, issue #54).
+async fn reg_write_on(eps: &mut ClaimedEndpoints, address: u8, data: &[u8]) -> Result<()> {
+    debug!(
+        "Writing {} bytes to register 0x{:02X}: {:02X?}",
+        data.len(),
+        address,
+        data
+    );
+
+    let mut buffer = Vec::with_capacity(data.len() + 1);
+    buffer.push(address);
+    buffer.extend_from_slice(data);
+
+    eps.register_write.submit(buffer.into());
+    complete_or_cancel(&mut eps.register_write, Duration::from_secs(1))
+        .await?
+        .status
+        .map_err(QA40xError::from)?;
+
+    debug!("Successfully wrote to register 0x{:02X}", address);
+    Ok(())
+}
+
+/// One telemetry poll on already-claimed endpoints — the core of
+/// [`QA40xDevice::read_telemetry`].
+async fn telemetry_on(eps: &mut ClaimedEndpoints) -> Result<Telemetry> {
+    let rd = |v: Vec<u8>| -> u32 {
+        if v.len() == 4 {
+            u32::from_be_bytes([v[0], v[1], v[2], v[3]])
+        } else {
+            0
+        }
+    };
+    let usb_v = rd(reg_read_on(eps, registers::TELEM_USB_VOLTAGE).await?);
+    let usb_i = rd(reg_read_on(eps, registers::TELEM_USB_CURRENT).await?);
+    let iso_i = rd(reg_read_on(eps, registers::TELEM_ISO_CURRENT).await?);
+    // Historically polled as a fifth telemetry word; actually the firmware
+    // trace-buffer length (constant 0x418 on a healthy unit). Kept in the
+    // poll so the raw readout stays available.
+    let extra = rd(reg_read_on(eps, registers::TRACE_LEN).await?);
+    let temp = rd(reg_read_on(eps, registers::TELEM_TEMPERATURE).await?);
+    Ok(Telemetry {
+        usb_voltage_v: usb_v as f32 / 1000.0,
+        usb_current_ma: usb_i as f32,
+        iso_current_ma: iso_i as f32,
+        temperature_c: temp as f32 / 10.0,
+        raw_usb_voltage: usb_v,
+        raw_usb_current: usb_i,
+        raw_iso_current: iso_i,
+        raw_extra: extra,
+        raw_temperature: temp,
+    })
+}
+
+/// One keepalive cycle on already-claimed endpoints: link-register (0x00)
+/// write, then a telemetry poll — the core of [`QA40xDevice::keepalive`] and
+/// of the pump's in-capture keepalive (issue #54).
+async fn keepalive_on(eps: &mut ClaimedEndpoints) -> Result<Telemetry> {
+    reg_write_on(
+        eps,
+        registers::LINK_KEEPALIVE,
+        &0x1234_5678u32.to_be_bytes(),
+    )
+    .await?;
+    telemetry_on(eps).await
+}
+
+#[async_trait]
+impl RegisterOps for QA40xDevice {
+    async fn read_register(&self, address: u8) -> Result<Vec<u8>> {
+        let mut guard = self.eps.lock().await;
+        let eps = guard.as_mut().ok_or(QA40xError::DeviceNotOpened)?;
+        reg_read_on(eps, address).await
+    }
+
+    async fn write_register(&self, address: u8, data: &[u8]) -> Result<()> {
+        let mut guard = self.eps.lock().await;
+        let eps = guard.as_mut().ok_or(QA40xError::DeviceNotOpened)?;
+        reg_write_on(eps, address, data).await
+    }
+}
+
+impl Default for QA40xDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Vrms produced per unit of full-scale-referenced digital RMS on the DAC, at
+/// an output full scale of `out_fs_dbv`. The output range's dBV is defined as
+/// the RMS of a **sine at DAC full scale**: digital peak 1.0 (RMS 1/√2)
+/// ↦ 10^(outFS/20) Vrms, hence the √2. Getting this wrong by dropping the √2
+/// is a systematic 3.01 dB error on every displayed output level.
+fn dac_volts_per_digital_rms(out_fs_dbv: f32) -> f32 {
+    std::f32::consts::SQRT_2 * 10.0f32.powf(out_fs_dbv / 20.0)
+}
+
+/// Clamp a requested stimulus frequency to what can actually be played
+/// without aliasing: `[1 Hz, 0.98 · Nyquist]` (issue #29 review finding #1 —
+/// mirrors the frontend's `playedFrequencyHz`; `measure_levels` has no
+/// harmonic to protect, unlike the THD sweep's 0.45·Nyquist cap, so it can
+/// use the full sub-Nyquist range).
+pub fn effective_stimulus_freq(requested: f32, sample_rate: u32) -> f32 {
+    let nyquist = sample_rate as f32 / 2.0;
+    requested.clamp(1.0, nyquist * 0.98)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dac_dbfs_to_dbv_offset_is_the_range_plus_the_sine_rms_sqrt2() {
+        // A digital full-scale sine plays at the range's dBV RMS, so the
+        // dBFS→dBV offset (in dB) is outFS + 20·log10(√2) ≈ outFS + 3.0103.
+        for (fs, expect) in [(8.0f32, 11.0103f32), (18.0, 21.0103), (-12.0, -8.9897)] {
+            let off = 20.0 * dac_volts_per_digital_rms(fs).log10();
+            assert!(
+                (off - expect).abs() < 1e-3,
+                "outFS {fs}: offset {off} != {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_minus_output_offset_matches_the_validated_loopback_identity() {
+        // `fr_calibration_offset` (hardware-validated: a resistive loopback FR
+        // reads ~0 dB) is `inFS − outFS − 9 + cal_adc + cal_dac` with the 9 =
+        // 3 (DAC peak↔sine-RMS) + 6 (differential ADC input). The two per-
+        // converter offsets must reproduce it: input (inFS − 6 + cal_adc)
+        // minus output (outFS + √2 − cal_dac). Trim-free case checked here;
+        // the FR path rounds √2 to 3.0 dB, hence the 0.011 dB tolerance.
+        let (in_fs, out_fs) = (6.0f32, 8.0f32);
+        let input_off = in_fs - 6.0;
+        let output_off = 20.0 * dac_volts_per_digital_rms(out_fs).log10();
+        let fr_offset = in_fs - out_fs - 9.0;
+        assert!(((input_off - output_off) - fr_offset).abs() < 0.011);
+    }
+
+    #[test]
+    fn effective_stimulus_freq_clamps_to_98pct_of_nyquist() {
+        // Below the cap: passed through unchanged.
+        assert_eq!(effective_stimulus_freq(1000.0, 48000), 1000.0);
+        // 30 kHz at 48 kHz sample rate would alias past Nyquist (24 kHz) —
+        // clamped to 0.98 * 24000 = 23520, not silently folded back.
+        assert!((effective_stimulus_freq(30000.0, 48000) - 23520.0).abs() < 1e-3);
+        // A sub-1 Hz or negative request floors at 1 Hz.
+        assert_eq!(effective_stimulus_freq(0.0, 48000), 1.0);
+        assert_eq!(effective_stimulus_freq(-5.0, 48000), 1.0);
+        // Scales with the sample rate (192 kHz Nyquist = 96 kHz).
+        assert!((effective_stimulus_freq(100000.0, 192000) - 94080.0).abs() < 1e-3);
+    }
+}

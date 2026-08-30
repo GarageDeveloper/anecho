@@ -1,0 +1,51 @@
+[package]
+name = "qa40x-driver"
+description = "USB driver for the QuantAsylum QA402/QA403 audio analyzers (unofficial): registers, factory calibration, ranges, synchronous generate-and-capture streaming"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+keywords = ["audio", "usb", "measurement", "quantasylum", "qa403"]
+categories = ["hardware-support", "multimedia::audio"]
+readme = "README.md"
+
+[features]
+default = ["serde"]
+# serde derives on the public value types (ranges, config, telemetry, ...).
+serde = ["dep:serde", "dep:serde_json"]
+# ts-rs derives, for consumers that export TypeScript bindings.
+ts = ["dep:ts-rs", "serde"]
+# Embedded virtual QA40x (the `vqa40x-core` simulator) behind the same endpoint
+# queues as the hardware: a `VirtualDeviceSource` and `QA40xDevice::connect_virtual`.
+sim = ["dep:vqa40x-core"]
+
+[dependencies]
+nusb = { version = "0.2", features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+async-trait.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+ts-rs = { version = "12", features = ["no-serde-warnings", "serde-compat"], optional = true }
+vqa40x-core = { git = "https://github.com/GarageDeveloper/virtual-qa40x-rs", tag = "v0.5.0", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+env_logger = "0.11"
+
+[[example]]
+name = "hw_keepalive"
+[[example]]
+name = "hw_readstate"
+[[example]]
+name = "hw_loopback"
+
+[[test]]
+name = "virtual_device"
+required-features = ["sim"]
+
+[lints]
+workspace = true

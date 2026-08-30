@@ -2,8 +2,9 @@
 resolver = "3"
 members = [
     "backend/crates/*",
+    "drivers/*",
 ]
-# Added in later phase-0 tasks: drivers/qa40x-driver, frontend/src-tauri, testbench
+# Added in later phase-0 tasks: frontend/src-tauri, testbench
 
 [workspace.package]
 version = "0.1.0"
