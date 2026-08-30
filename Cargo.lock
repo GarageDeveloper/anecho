@@ -108,6 +108,7 @@ name = "anecho-desktop"
 version = "0.1.0"
 dependencies = [
  "anecho",
+ "anecho-engine",
  "anecho-server",
  "env_logger",
  "log",
