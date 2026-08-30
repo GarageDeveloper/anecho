@@ -4,3 +4,6 @@ dist/
 *.gen.rs
 *.gen.ts
 .DS_Store
+
+# Generated contract types (TypeScript)
+frontend/src/gen/

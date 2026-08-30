@@ -1,0 +1,35 @@
+// Anecho — API contract v0.
+//
+// Transport: WebSocket. Control messages and events use the protobuf `Envelope` below
+// (WebSocket binary messages). Real-time streams (level meters, RTA, ...) travel as raw
+// binary frames of Float32 values referenced by `stream_id`; their layout is documented
+// where the stream is defined.
+//
+// Evolution rules: additive only — new optional fields and new `oneof` variants. Never
+// rename, renumber or remove anything before a major version. `buf breaking` enforces this.
+syntax = "proto3";
+package anecho.v0;
+
+message Envelope {
+  uint64 request_id = 1;
+  oneof payload {
+    ListDevicesRequest list_devices = 10;
+    ListDevicesResponse devices = 11;
+    // Phase 0: sessions, streams, level meters. Later phases: additive only.
+  }
+}
+
+message ListDevicesRequest {}
+
+message DeviceInfo {
+  string id = 1;
+  string display_name = 2;
+  bool factory_calibrated = 3;   // true: QA40x; false: generic sound card
+  repeated uint32 sample_rates = 4;
+  uint32 input_channels = 5;
+  uint32 output_channels = 6;
+}
+
+message ListDevicesResponse {
+  repeated DeviceInfo devices = 1;
+}

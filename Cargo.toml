@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "backend/crates/*",
+]
+# Added in later phase-0 tasks: drivers/qa40x-driver, frontend/src-tauri, testbench
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/garagedeveloper/anecho"
+authors = ["Anecho contributors"]
+
+[workspace.dependencies]
+anecho-contract = { path = "backend/crates/anecho-contract" }
+
+prost = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
