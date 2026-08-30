@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hzLabel, logAxisPlan, logSplits, mantissaOf } from "./axis";
+import { bandLabels, hzLabel, logAxisPlan, logSplits, mantissaOf, xAxisModel } from "./axis";
 
 describe("log axis plan", () => {
   it("formats compact frequency labels", () => {
@@ -43,5 +43,30 @@ describe("log axis plan", () => {
   it("exposes decades for the stronger gridlines", () => {
     expect(logAxisPlan(20, 20000, 800).decades).toEqual([100, 1000, 10000]);
     expect(mantissaOf(20000)).toBe(2);
+  });
+});
+
+describe("x-axis model", () => {
+  it("octave bands always use the index scale, never the log plan", () => {
+    const bands = xAxisModel(true, true, 29);
+    expect(bands.kind).toBe("bands");
+    if (bands.kind === "bands") {
+      expect(bands.indices).toHaveLength(29);
+      expect(bands.indices[0]).toBe(0);
+      expect(bands.indices[28]).toBe(28);
+    }
+    expect(xAxisModel(true, false, 1000).kind).toBe("log");
+    expect(xAxisModel(false, false, 512).kind).toBe("linear");
+  });
+
+  it("labels every band centre, thinned by slot width", () => {
+    const centres = Array.from({ length: 29 }, (_, i) => 25 * Math.pow(2, i / 3));
+    const wide = bandLabels(centres, 29 * 50);
+    expect(wide.filter((l) => l !== "")).toHaveLength(29);
+    expect(wide[0]).toBe("25");
+    const mid = bandLabels(centres, 29 * 30);
+    expect(mid.filter((l) => l !== "")).toHaveLength(15);
+    const narrow = bandLabels(centres, 29 * 6);
+    expect(narrow.filter((l) => l !== "")).toHaveLength(5);
   });
 });

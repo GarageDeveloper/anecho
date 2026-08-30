@@ -6,7 +6,7 @@
   import { onMount } from "svelte";
   import type { CursorReadout } from "../lib/stores.svelte";
   import { channelBars, nearestSlot, slotWidth } from "../lib/bars";
-  import { hzLabel, logAxisPlan, type LogAxisPlan } from "../lib/axis";
+  import { bandLabels, logAxisPlan, xAxisModel, type LogAxisPlan } from "../lib/axis";
 
   interface Props {
     axis: number[];
@@ -56,17 +56,9 @@
     return plan;
   }
 
-  /** Labels for octave bands: one per band centre, thinned when they would overlap. */
-  function bandAxisValues(u: uPlot, vals: number[]): string[] {
-    const centres = u.data[0] as number[];
-    const px = u.bbox.width / Math.max(1, centres.length) / (window.devicePixelRatio || 1);
-    const every = px >= 44 ? 1 : px >= 24 ? 2 : px >= 14 ? 3 : 6;
-    return vals.map((v) => {
-      const i = centres.findIndex((c) => Math.abs(c - v) <= Math.abs(c) * 1e-6);
-      if (i < 0 || i % every !== 0) return "";
-      return hzLabel(v);
-    });
-  }
+  // Band mode: the X data are indices on a plain linear scale (one even slot per band);
+  // `axis` keeps the band centre frequencies for labels and the cursor readout.
+  const model = $derived(xAxisModel(xLog, bars, axis.length));
 
   let host: HTMLDivElement;
   let plot: uPlot | null = null;
@@ -74,7 +66,8 @@
   let pending = false;
 
   function toData(): uPlot.AlignedData {
-    return [axis, ...series.map((v) => Array.from(v))];
+    const x = model.kind === "bands" ? model.indices : axis;
+    return [x, ...series.map((v) => Array.from(v))];
   }
 
   /** Pixel X (canvas space) of every X value of the data. */
@@ -131,8 +124,15 @@
       cursor: { drag: { x: false, y: false } },
       legend: { show: false },
       scales: {
-        // Octave bands: ordinal X (one slot per band); log points: true log scale.
-        x: xLog ? (bars ? { distr: 2 } : { distr: 3, log: 10 }) : { time: false },
+        // Octave bands: linear index scale, half a slot of padding on each side; log
+        // points: true log scale. (Never uPlot's `distr: 2`: its splits and scale bounds
+        // are indices into data[0], not values — the source of the t12 regression.)
+        x:
+          model.kind === "bands"
+            ? { time: false, range: () => [-0.5, Math.max(axis.length - 1, 0) + 0.5] }
+            : model.kind === "log"
+              ? { distr: 3, log: 10 }
+              : { time: false },
         y: { range: () => [yMin, yMax] },
       },
       axes: [
@@ -141,8 +141,18 @@
           stroke: "#8b929c",
           grid: { stroke: "#2e333b", width: 1 },
           ticks: { stroke: "#2e333b" },
-          values: bars ? bandAxisValues : xLog ? (u: uPlot) => currentPlan(u).labels : undefined,
-          splits: bars ? (u) => u.data[0] as number[] : xLog ? (u: uPlot) => currentPlan(u).splits : undefined,
+          values:
+            model.kind === "bands"
+              ? (u: uPlot) => bandLabels(axis, u.bbox.width / (window.devicePixelRatio || 1))
+              : model.kind === "log"
+                ? (u: uPlot) => currentPlan(u).labels
+                : undefined,
+          splits:
+            model.kind === "bands"
+              ? () => (model.kind === "bands" ? model.indices : [])
+              : model.kind === "log"
+                ? (u: uPlot) => currentPlan(u).splits
+                : undefined,
         },
         {
           label: yLabel,
@@ -152,7 +162,7 @@
           size: 60,
         },
         // Log mode only: a second X axis carrying no labels, just stronger decade lines.
-        ...(xLog && !bars
+        ...(model.kind === "log"
           ? ([
               {
                 scale: "x",
@@ -178,7 +188,8 @@
             const leftPx = left * (window.devicePixelRatio || 1);
             const idx = nearestSlot(centresPx(u), leftPx);
             if (idx < 0) return;
-            const x = u.data[0][idx] as number;
+            // Band mode: report the band's centre frequency, not its index.
+            const x = model.kind === "bands" ? axis[idx] : (u.data[0][idx] as number);
             const values = u.data.slice(1).map((d) => (d[idx] == null ? null : (d[idx] as number)));
             onCursor({ x, values });
           },

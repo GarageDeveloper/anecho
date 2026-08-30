@@ -57,11 +57,18 @@
     </section>
     <section>
       <h2>4 · Capture</h2>
-      {#if app.running || app.restarting || app.measuringPaused}
-        <button onclick={() => app.stop()} disabled={app.measuringPaused}>Stop</button>
-        <div class="state ok">
-          {app.measuringPaused ? "measuring…" : app.restarting ? "restarting…" : `streaming ${app.tab}`}
-        </div>
+      {#if app.measuringPaused}
+        <button disabled><span class="spinner"></span> Stop</button>
+        <div class="state ok">measuring…</div>
+      {:else if app.streamPhase === "starting"}
+        <button class="primary" disabled><span class="spinner"></span> Starting…</button>
+        <div class="state">starting {app.tab}…</div>
+      {:else if app.streamPhase === "stopping"}
+        <button disabled><span class="spinner"></span> Stopping…</button>
+        <div class="state">stopping…</div>
+      {:else if app.running}
+        <button onclick={() => app.stop()}>Stop</button>
+        <div class="state ok">streaming {app.tab}</div>
       {:else}
         <button
           class="primary"
@@ -81,6 +88,9 @@
       {/each}
     </nav>
     <div class="content">
+      {#if app.waitingForData}
+        <div class="waiting"><span class="spinner"></span> waiting for data…</div>
+      {/if}
       {#if app.tab === "levels"}
         <LevelMeters />
       {:else if app.tab === "rta"}
@@ -157,9 +167,41 @@
     border-bottom-color: var(--accent);
   }
   .content {
+    position: relative;
     flex: 1;
     min-height: 0;
     padding: 16px 24px 24px;
     overflow: auto;
+  }
+  .waiting {
+    position: absolute;
+    top: 56px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    background: rgba(20, 23, 28, 0.85);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .spinner {
+    display: inline-block;
+    width: 11px;
+    height: 11px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: -1px;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

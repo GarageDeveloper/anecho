@@ -12,7 +12,7 @@
   ];
 
   const canMeasure = $derived(
-    app.connection === "connected" && !!app.selectedDevice && !app.measure.busy && !app.restarting,
+    app.connection === "connected" && !!app.selectedDevice && !app.measure.busy && !app.transitioning,
   );
   const isImd = $derived(
     app.measure.result?.kind === MeasureKind.IMD_SMPTE || app.measure.result?.kind === MeasureKind.IMD_CCIF,

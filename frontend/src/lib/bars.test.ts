@@ -43,3 +43,22 @@ describe("grouped octave bars", () => {
     expect(nearestSlot([], 5)).toBe(-1);
   });
 });
+
+describe("octave axis of 29 centres on a linear index scale", () => {
+  it("derives 29 even slots and one rectangle per band", () => {
+    const indices = Array.from({ length: 29 }, (_, i) => i);
+    const px = indices.map((i) => 20 + i * 40); // even index positions
+    expect(slotWidth(px, 1160)).toBe(40);
+    const rects = channelBars(
+      px,
+      indices.map(() => -30),
+      0,
+      2,
+      40,
+      300,
+      () => 100,
+    );
+    expect(rects).toHaveLength(29);
+    expect(rects[0].h).toBe(200);
+  });
+});

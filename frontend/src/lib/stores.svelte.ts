@@ -126,8 +126,12 @@ class AppState {
   overruns = $state(0);
   rangeChanges = $state(0);
   cursor = $state<CursorReadout | null>(null);
-  /** True while a running stream is stopped and started again after a control change. */
-  restarting = $state(false);
+  /** The user's intent: streaming on or off. The reconciler makes reality match. */
+  wantStreaming = $state(false);
+  /** UI phase of the stream reconciler — immediate feedback on Start/Stop/switches. */
+  streamPhase = $state<"idle" | "starting" | "stopping" | "streaming">("idle");
+  /** True once the first LEVELS frame of the current stream arrived. */
+  private levelsSeen = $state(false);
   /** True while a stream is paused for a one-shot measurement and will resume after it. */
   measuringPaused = $state(false);
   rta = new RtaSettings();
@@ -136,6 +140,11 @@ class AppState {
 
   private client: Client | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Single-flight reconciler state: at most one transition runs; requests coalesce. */
+  private syncPromise: Promise<void> | null = null;
+  private syncAgain = false;
+  /** Stream signature the running stream was started with. */
+  private activeSignature = "";
 
   get selectedDevice(): DeviceInfo | undefined {
     return this.devices.find((d) => d.id === this.selectedDeviceId);
@@ -143,6 +152,22 @@ class AppState {
 
   get running(): boolean {
     return this.stream !== null;
+  }
+
+  /** True from Start until the first frame of the active stream arrived. */
+  get waitingForData(): boolean {
+    if (this.streamPhase === "starting") return true;
+    const s = this.stream;
+    if (!s || this.streamPhase !== "streaming") return false;
+    if (s.kind === StreamKind.LEVELS) return !this.levelsSeen;
+    if (s.kind === StreamKind.RTA) return this.rtaData?.seq === -1n;
+    if (s.kind === StreamKind.SCOPE) return this.scopeData?.seq === -1n;
+    return false;
+  }
+
+  /** True while a transition (start, stop, restart, tab switch) is in flight. */
+  get transitioning(): boolean {
+    return this.streamPhase === "starting" || this.streamPhase === "stopping";
   }
 
   get calibrated(): boolean {
@@ -172,6 +197,8 @@ class AppState {
         this.client = null;
         this.sessionId = null;
         this.firmwareVersion = "";
+        this.wantStreaming = false;
+        this.streamPhase = "idle";
         this.clearStream();
       });
       c.onFrame((f) => this.onFrame(f));
@@ -226,13 +253,15 @@ class AppState {
     if (!d.factoryCalibrated) generator.levelUnit = "dbfs";
   }
 
-  /** Switch tab; when a stream is running, restart it with the new kind (one stream per session). */
-  async selectTab(tab: Tab) {
+  /**
+   * Switch tab: the UI changes immediately; the stream reconciler follows. Clicks always
+   * take effect — a click during a transition is coalesced, the latest tab wins.
+   */
+  selectTab(tab: Tab) {
     if (tab === this.tab) return;
-    const wasRunning = this.running;
-    if (wasRunning) await this.stopStream();
     this.tab = tab;
-    if (wasRunning) await this.startStream();
+    this.cursor = null;
+    this.requestSync();
   }
 
   /**
@@ -241,22 +270,50 @@ class AppState {
    * backend. Session settings (sample rate, ranges) still need an explicit stop.
    */
   scheduleRestart() {
-    if (!this.running && !this.restarting) return;
+    if (!this.wantStreaming) return;
     if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.restarting = true;
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      void this.restartNow();
+      this.requestSync();
     }, 250);
   }
 
-  private async restartNow() {
-    try {
-      await this.stopStream();
-      await this.startStream();
-    } finally {
-      this.restarting = false;
+  /**
+   * Ask the reconciler to make the running stream match the current intent (tab, settings,
+   * `wantStreaming`). Never blocks the caller; at most one transition runs at a time and
+   * requests made during it are applied when it ends.
+   */
+  requestSync(): Promise<void> {
+    this.syncAgain = true;
+    this.syncPromise ??= this.runSync().finally(() => {
+      this.syncPromise = null;
+    });
+    return this.syncPromise;
+  }
+
+  private async runSync() {
+    while (this.syncAgain) {
+      this.syncAgain = false;
+      if (this.measure.busy) break; // runMeasure resyncs when it finishes
+      const want = this.wantStreaming && this.connection === "connected" && !!this.selectedDevice;
+      const kind = this.tabKind();
+      const stale =
+        this.stream !== null &&
+        (!want || this.stream.kind !== kind || this.streamSignature !== this.activeSignature);
+      if (stale) {
+        this.streamPhase = want ? "starting" : "stopping";
+        await this.stopStreamInner();
+      }
+      if (want && this.stream === null) {
+        this.streamPhase = "starting";
+        await this.startStreamInner();
+      }
     }
+    this.streamPhase = this.stream !== null ? "streaming" : "idle";
+  }
+
+  private tabKind(): StreamKind {
+    return this.tab === "rta" ? StreamKind.RTA : this.tab === "scope" ? StreamKind.SCOPE : StreamKind.LEVELS;
   }
 
   /** Every request parameter as one string; the tabs watch it to trigger restarts. */
@@ -301,14 +358,17 @@ class AppState {
 
   /** Start the stream of the current tab (opening the session if needed). */
   async start() {
-    await this.startStream();
+    this.wantStreaming = true;
+    await this.requestSync();
   }
 
-  private async startStream() {
+  private async startStreamInner() {
     const c = this.client;
-    if (!c || this.running) return;
+    if (!c || this.stream !== null) return;
+    const signature = this.streamSignature;
     this.error = "";
     this.overruns = 0;
+    this.levelsSeen = false;
     try {
       const sessionId = await this.ensureSession();
       if (sessionId === null) return;
@@ -350,6 +410,7 @@ class AppState {
       const stream = await c.startStream(req);
       this.error = "";
       this.stream = stream;
+      this.activeSignature = signature;
       this.unit = stream.scale?.unit.case === "dbvOffset" ? "dBV" : "dBFS";
       this.levels = Array.from({ length: stream.channels }, () => ({ rms: -200, peak: -200 }));
       const empty = () =>
@@ -357,12 +418,14 @@ class AppState {
       if (kind === StreamKind.RTA) this.rtaData = { axis: stream.axisHz, series: empty(), seq: -1n };
       if (kind === StreamKind.SCOPE) this.scopeData = { axis: stream.axisSeconds, series: empty(), seq: -1n };
     } catch (e) {
+      // Do not retry in a loop: drop the intent so the reconciler settles to idle.
       this.error = describe(e);
-      await this.stop();
+      this.wantStreaming = false;
+      this.clearStream();
     }
   }
 
-  private async stopStream() {
+  private async stopStreamInner() {
     const c = this.client;
     if (!c) return;
     try {
@@ -374,17 +437,22 @@ class AppState {
     }
   }
 
-  /** Stop the stream and close the session. */
+  /** Stop the stream and close the session (releases the device). */
   async stop() {
+    this.wantStreaming = false;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    await this.requestSync();
     const c = this.client;
     if (!c) return;
-    await this.stopStream();
     try {
-      if (this.sessionId !== null) await c.closeSession(this.sessionId);
+      if (this.sessionId !== null && this.stream === null) await c.closeSession(this.sessionId);
     } catch (e) {
       this.error = describe(e);
     } finally {
-      this.sessionId = null;
+      if (this.stream === null) this.sessionId = null;
     }
   }
 
@@ -395,7 +463,9 @@ class AppState {
    */
   async runMeasure(kind: MeasureKind) {
     const c = this.client;
-    if (!c || this.measure.busy || this.restarting) return;
+    if (!c || this.measure.busy) return;
+    // Let an in-flight transition settle first (single-flight promise).
+    if (this.syncPromise) await this.syncPromise;
     this.measure.busy = true;
     this.measure.kind = kind;
     this.error = "";
@@ -403,7 +473,7 @@ class AppState {
     try {
       if (wasRunning) {
         this.measuringPaused = true;
-        await this.stopStream();
+        await this.stopStreamInner();
       }
       const sessionId = await this.ensureSession();
       if (sessionId === null) return;
@@ -424,10 +494,8 @@ class AppState {
       this.error = describe(e);
     } finally {
       this.measure.busy = false;
-      if (wasRunning) {
-        this.measuringPaused = false;
-        await this.startStream();
-      }
+      this.measuringPaused = false;
+      if (wasRunning) void this.requestSync();
     }
   }
 
@@ -453,6 +521,7 @@ class AppState {
           next.push({ rms: v[0], peak: v[1] });
         }
         this.levels = next;
+        this.levelsSeen = true;
         break;
       }
       case StreamKind.RTA:

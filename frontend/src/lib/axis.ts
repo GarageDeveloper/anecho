@@ -74,3 +74,39 @@ export function logAxisPlan(minHz: number, maxHz: number, widthPx: number, label
   const decades = splits.filter((v) => mantissaOf(v) === 1);
   return { splits, labels, decades };
 }
+
+// ---------------------------------------------------------------------------------------
+// X-axis model: which treatment a graph uses. A pure decision, unit-tested, so the
+// log-points and octave-band modes cannot silently swap again (the t12 regression applied
+// the log plan to the band mode).
+// ---------------------------------------------------------------------------------------
+
+export type XAxisModel =
+  | { kind: "linear" }
+  | { kind: "log" }
+  | { kind: "bands"; indices: number[] };
+
+/**
+ * Octave bands always win: band centres are positioned by index on a plain linear scale
+ * (one even slot per band) — never through a log mapping, and never through uPlot's
+ * ordinal `distr: 2`, whose custom splits and scale bounds are indices into `data[0]`,
+ * not values.
+ */
+export function xAxisModel(xLog: boolean, bars: boolean, pointCount: number): XAxisModel {
+  if (bars) return { kind: "bands", indices: Array.from({ length: pointCount }, (_, i) => i) };
+  return xLog ? { kind: "log" } : { kind: "linear" };
+}
+
+/** Label-thinning step for band labels given the pixel width of one band slot. */
+export function bandLabelStep(slotPx: number): number {
+  return slotPx >= 44 ? 1 : slotPx >= 24 ? 2 : slotPx >= 14 ? 3 : 6;
+}
+
+/** One label per band centre, thinned to every `bandLabelStep`-th so they never collide. */
+export function bandLabels(centres: ArrayLike<number>, widthPx: number): string[] {
+  const n = centres.length;
+  const step = bandLabelStep(widthPx / Math.max(1, n));
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) out.push(i % step === 0 ? hzLabel(centres[i]) : "");
+  return out;
+}
