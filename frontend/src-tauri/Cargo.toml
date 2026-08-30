@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 anecho = { path = "../../backend/crates/anecho" }
 anecho-server = { path = "../../backend/crates/anecho-server" }
+anecho-engine = { path = "../../backend/crates/anecho-engine" }
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
 env_logger.workspace = true

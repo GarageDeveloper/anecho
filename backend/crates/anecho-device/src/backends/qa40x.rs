@@ -439,6 +439,25 @@ impl MeasurementDevice for Qa40xDevice {
         }
     }
 
+    async fn release(&self) {
+        // Stop a still-running stream first (drained — the in-flight call completes).
+        let handle = self.state.lock().await.running.as_ref().map(|r| r.handle);
+        if let Some(h) = handle {
+            let _ = self.stop(h).await;
+        }
+        // Leave the hardware safe: 42 dBV input range, STREAM_STOP, I2S off (the driver's
+        // disconnect teardown, same policy as qa40x-rs on exit).
+        let dev = self.handle.lock().await;
+        if let Err(e) = dev.disconnect().await {
+            log::warn!("{}: release: {e}", self.descriptor.id);
+        } else {
+            log::info!(
+                "{}: released (safe input range, stream stopped)",
+                self.descriptor.id
+            );
+        }
+    }
+
     /// Range write between two capture chunks: the worker only holds the device mutex
     /// during `generate_and_capture`, so this waits for the current chunk, writes the range
     /// (the driver handles the attenuator-out quirk) and refreshes the cached dBV offset.

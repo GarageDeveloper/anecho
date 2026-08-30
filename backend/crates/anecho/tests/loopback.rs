@@ -367,3 +367,46 @@ async fn two_sessions_share_one_open_qa40x() {
     // ...and can again once it stopped.
     b.open_session(&dev.id, cfg).await.unwrap();
 }
+
+/// Closing the last session must release the device (QA40x: driver disconnect — the sim
+/// accepts a reconnection afterwards, which is exactly what release performs).
+#[cfg(feature = "qa40x-sim")]
+#[tokio::test]
+async fn last_session_close_releases_the_device() {
+    use anecho_device::backends::qa40x::Qa40xBackend;
+    let registry =
+        DeviceRegistry::new().with_backend(Arc::new(Qa40xBackend::empty().with_simulator(false)));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, _task) = anecho_server::serve(
+        Engine::new(registry),
+        "127.0.0.1:0".parse().unwrap(),
+        async {
+            let _ = stop_rx.await;
+        },
+    )
+    .await
+    .unwrap();
+    let _stop = stop_tx;
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+    let dev = client.list_devices().await.unwrap().remove(0);
+    let cfg = pb::DeviceConfig {
+        sample_rate: 48_000,
+        ..Default::default()
+    };
+    let s = client.open_session(&dev.id, cfg.clone()).await.unwrap();
+    let stream = client
+        .start_stream(pb::StartStreamRequest {
+            session_id: s.session_id,
+            kind: pb::StreamKind::Levels as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let _ = stream;
+    // Close with the stream still running: teardown must drain, then release.
+    client.close_session(s.session_id).await.unwrap();
+    // The device was disconnected by release(); a new session reconnects it.
+    let s2 = client.open_session(&dev.id, cfg).await.unwrap();
+    assert!(s2.session_id > s.session_id);
+    client.close_session(s2.session_id).await.unwrap();
+}

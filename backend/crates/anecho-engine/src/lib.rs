@@ -227,6 +227,17 @@ impl Engine {
         if let Some(rs) = session.stream {
             Self::teardown(&session.device, rs, &self.events).await;
         }
+        // Last user of this device? Put the hardware back in a safe state (QA40x: safe
+        // input range, stream stopped) — every client exit path funnels here.
+        let still_used = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .any(|s| Arc::ptr_eq(&s.device, &session.device));
+        if !still_used {
+            session.device.release().await;
+        }
         Ok(())
     }
 

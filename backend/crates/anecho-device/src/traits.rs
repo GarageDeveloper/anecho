@@ -96,6 +96,12 @@ pub trait MeasurementDevice: Send + Sync {
 
     fn latency(&self) -> LatencyInfo;
 
+    /// Release the device: stop any running stream (draining) and leave the hardware in a
+    /// safe state for the next user (a QA40x gets its safe 42 dBV input range, STREAM_STOP
+    /// and I2S off — what qa40x-rs does on exit). Called by the engine when the last
+    /// session using the device closes, and on shutdown. Default: nothing.
+    async fn release(&self) {}
+
     /// Switch the input range **while streaming** (between capture blocks). Backends with
     /// ranges implement it; `scale(Direction::Input)` reflects the new range afterwards.
     async fn set_input_range(&self, _index: usize) -> Result<()> {
