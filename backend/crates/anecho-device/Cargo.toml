@@ -35,3 +35,15 @@ env_logger = "0.11"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "qa40x_probe"
+required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_relay_matrix"
+required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_sim_profile"
+required-features = ["qa40x-sim"]
