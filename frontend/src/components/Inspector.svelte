@@ -2,6 +2,7 @@
   import { app, AVERAGING_MODES, windowLabel } from "../lib/stores.svelte";
   import { generator } from "../lib/generator.svelte";
   import { RtaConfig_Averaging_Mode, StreamKind } from "../gen/anecho_pb";
+  import { sigFigs } from "../lib/yrange";
   import MeasurePanel from "./MeasurePanel.svelte";
 
   const kindName: Record<number, string> = {
@@ -12,7 +13,10 @@
   };
 
   function fmt(v: number | null, digits = 2): string {
-    return v == null || !Number.isFinite(v) ? "—" : v.toFixed(digits);
+    if (v == null || !Number.isFinite(v)) return "—";
+    // Scope values are raw samples, often thousandths of full scale: show significant
+    // digits instead of two decimals (which would read 0.00).
+    return app.tab === "scope" ? sigFigs(v, 4) : v.toFixed(digits);
   }
 
   function fmtX(x: number): string {

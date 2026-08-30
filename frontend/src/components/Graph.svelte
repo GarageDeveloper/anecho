@@ -16,6 +16,8 @@
     xLabel?: string;
     yLabel?: string;
     yRange?: [number, number];
+    /** Optional Y tick formatter (e.g. engineering amplitude labels for the scope). */
+    yValues?: (v: number) => string;
     bars?: boolean;
     seriesNames?: string[];
     /** Hidden state per channel, owned by the tab so it survives tab switches. */
@@ -32,6 +34,7 @@
     xLabel = "",
     yLabel = "",
     yRange = [-120, 20],
+    yValues = undefined,
     bars = false,
     seriesNames = [],
     hidden = [],
@@ -116,7 +119,6 @@
         fill: bars ? color + "88" : undefined,
       });
     }
-    const [yMin, yMax] = yRange;
     const opts: uPlot.Options = {
       width: host.clientWidth || 600,
       height: host.clientHeight || 300,
@@ -133,7 +135,8 @@
             : model.kind === "log"
               ? { distr: 3, log: 10 }
               : { time: false },
-        y: { range: () => [yMin, yMax] },
+        // Read the live prop so an auto-scaled Y range follows without a rebuild.
+        y: { range: () => [yRange[0], yRange[1]] },
       },
       axes: [
         {
@@ -160,6 +163,7 @@
           grid: { stroke: "#2e333b", width: 1 },
           ticks: { stroke: "#2e333b" },
           size: 60,
+          values: yValues ? (_u: uPlot, splits: number[]) => splits.map(yValues) : undefined,
         },
         // Log mode only: a second X axis carrying no labels, just stronger decade lines.
         ...(model.kind === "log"
@@ -235,8 +239,13 @@
     void series.length;
     void xLog;
     void bars;
-    void yRange;
     if (plot) build();
+  });
+
+  // Y range changes (auto-scale steps, manual selection) apply in place, no rebuild.
+  $effect(() => {
+    const [min, max] = yRange;
+    plot?.setScale("y", { min, max });
   });
   $effect(() => {
     void seq;

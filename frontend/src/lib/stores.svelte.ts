@@ -88,6 +88,13 @@ class ScopeSettings {
   triggerChannel = $state(0);
   /** Channels hidden in the plot (display only — not part of the stream signature). */
   hidden = $state<boolean[]>([]);
+  /**
+   * Y half-range: "auto" fits the waveform (display only — not part of the stream
+   * signature), a number is a fixed ±value from FIXED_Y_RANGES.
+   */
+  yMode = $state<"auto" | number>("auto");
+  /** Current half-range while yMode is "auto" (updated with hysteresis per frame). */
+  autoHalf = $state(1);
 }
 
 /**
