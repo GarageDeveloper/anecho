@@ -1,4 +1,4 @@
-use anecho_testbench::{Check, anecho, rew};
+use anecho_testbench::{Check, anecho, compare, rew};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -10,6 +10,27 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// A/B: the same sine through the same loopback device, measured by REW then by Anecho
+    /// (sequentially — both generators would sum otherwise). Compares the fundamental
+    /// level, THD, THD+N and the RTA peak with documented tolerances.
+    CompareThd {
+        #[arg(long, default_value = rew::DEFAULT_BASE_URL)]
+        rew: String,
+        #[arg(long, default_value = anecho::DEFAULT_URL)]
+        anecho: String,
+        /// REW device name (Java) of the loopback device.
+        #[arg(long, default_value = "BlackHole 2ch")]
+        rew_device: String,
+        /// Substring of the Anecho device id of the same loopback device.
+        #[arg(long, default_value = "BlackHole")]
+        anecho_device: String,
+        #[arg(long, default_value_t = 1000.0)]
+        frequency_hz: f64,
+        #[arg(long, default_value_t = -12.0)]
+        level_dbfs: f64,
+        #[arg(long, default_value_t = 4.0)]
+        seconds: f64,
+    },
     /// Drive REW alone through a loopback device: generator sine -> RTA -> peak and THD.
     /// Validates the REW client and the loopback wiring before any A/B comparison.
     RewRta {
@@ -41,6 +62,35 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
+        Cmd::CompareThd {
+            rew: rew_url,
+            anecho: anecho_url,
+            rew_device,
+            anecho_device,
+            frequency_hz,
+            level_dbfs,
+            seconds,
+        } => {
+            let r =
+                compare::rew_thd(&rew_url, &rew_device, frequency_hz, level_dbfs, seconds).await?;
+            let a =
+                compare::anecho_thd(&anecho_url, &anecho_device, frequency_hz, level_dbfs).await?;
+            let checks = compare::thd_checks(&r, &a);
+            let mut failed = false;
+            for c in &checks {
+                println!("{c}");
+                failed |= !c.ok;
+            }
+            println!(
+                "\nTolerances: fundamental ±0.1 dB, RTA peak ±0.3 dB, THD ±3 dB, THD+N ±3 dB."
+            );
+            println!(
+                "THD/THD+N need an analogue loopback (real converters) to be comparable; on a digital loopback they are informational."
+            );
+            if failed {
+                anyhow::bail!("some checks failed");
+            }
+        }
         Cmd::RewRta {
             rew: rew_url,
             device,

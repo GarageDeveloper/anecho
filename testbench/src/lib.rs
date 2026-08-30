@@ -3,6 +3,7 @@
 //! with documented tolerances) arrive with phase 2.
 
 pub mod anecho;
+pub mod compare;
 pub mod rew;
 
 /// Outcome of one comparison line.
