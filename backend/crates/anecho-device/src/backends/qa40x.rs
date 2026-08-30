@@ -564,7 +564,7 @@ fn best_lag(reference: &[f32], captured: &[f32], max_lag: usize) -> Option<usize
 /// Send a short chirp on the driven channels and measure when it comes back.
 async fn probe_latency(
     handle: &DeviceHandle,
-    cancel: &AtomicBool,
+    cancel: Option<&AtomicBool>,
     sample_rate: u32,
     drive_l: bool,
     drive_r: bool,
@@ -586,7 +586,7 @@ async fn probe_latency(
         .generate_and_capture_cancellable(
             if drive_l { &chirp } else { &zero },
             if drive_r { &chirp } else { &zero },
-            Some(cancel),
+            cancel,
         )
         .await
         .ok()?;
@@ -620,10 +620,15 @@ impl Worker {
         let offsets = *self.offsets_dbv.lock().unwrap();
         // Diagnostic hook (E18): skip the latency probe at stream start.
         let skip_probe = std::env::var_os("ANECHO_QA40X_SKIP_LATENCY_PROBE").is_some();
+        // Diagnostic hook (E22): stop never cancels the in-flight call; the worker only
+        // checks the stop flag between calls, so every USB transaction runs to completion.
+        let drain_stop = std::env::var_os("ANECHO_QA40X_DRAIN_STOP").is_some();
+        let call_cancel = if drain_stop { None } else { Some(&self.cancel) };
+        let call_cancel: Option<&AtomicBool> = call_cancel.map(|c| c.as_ref());
         let pad = if self.cfg.generate && (drive_l || drive_r) && !skip_probe {
             match probe_latency(
                 &self.handle,
-                &self.cancel,
+                call_cancel,
                 self.applied.sample_rate,
                 drive_l,
                 drive_r,
@@ -690,7 +695,7 @@ impl Worker {
             for attempt in 0..INSERTION_RETRIES {
                 let dev = self.handle.lock().await;
                 let res = dev
-                    .generate_and_capture_cancellable(&left, &right, Some(&self.cancel))
+                    .generate_and_capture_cancellable(&left, &right, call_cancel)
                     .await;
                 match res {
                     Ok(a) => {

@@ -98,6 +98,23 @@ async fn main() {
             .await
             .unwrap();
         }
+        if mode == "race" {
+            // E19: restarts stepping on each other — stop while the previous start is still
+            // in its latency probe / first chunk, at varying delays, no range writes at all.
+            let delays_ms = [20u64, 60, 120, 200, 350, 500];
+            for k in 0..12usize {
+                let sizes: Vec<u32> = std::env::var("SIZES").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or_else(|| vec![8192, 16384, 32768, 65536, 262144]);
+                let fft = sizes[k % sizes.len()];
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let h = dev.start(StreamConfig { block_frames: fft, capture: true, generate: true }, tx, Some(Box::new(Sine(0.0)))).await.unwrap();
+                tokio::select! {
+                    _ = rx.recv() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delays_ms[k % delays_ms.len()])) => {}
+                }
+                dev.stop(h).await.unwrap();
+            }
+            continue;
+        }
         if mode == "stop-write-start" {
             // E18: stop the stream (cancels the in-flight capture), write the range while
             // idle, restart immediately (no latency probe when SKIP is set).

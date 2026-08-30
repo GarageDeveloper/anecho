@@ -773,6 +773,16 @@ impl QA40xDevice {
         *self.model.lock().await = None;
     }
 
+    /// Diagnostic: clear the halt state of both data endpoints (what the stream error
+    /// path does after a cancelled capture). No-op when not connected.
+    pub async fn clear_data_endpoints(&self) -> Result<()> {
+        let mut guard = self.eps.lock().await;
+        let eps = guard.as_mut().ok_or(QA40xError::DeviceNotOpened)?;
+        let _ = eps.data_write.clear_halt().await;
+        let _ = eps.data_read.clear_halt().await;
+        Ok(())
+    }
+
     /// One keepalive cycle, mirroring the official app: write the link register
     /// (0x00) with a pattern, then read telemetry. Runs ~1 s while connected and
     /// idle (frontend poll) to hold the LINK LED lit, and between stream frames
