@@ -2,19 +2,29 @@
 //!
 //! The QA40x is a half-duplex USB pipe driven block by block: each
 //! `generate_and_capture` call sends a stimulus and returns the synchronous capture. The
-//! adapter loops such calls to produce a stream; samples inside one call are contiguous and
-//! sample-synchronous with the stimulus, but there is a short gap (USB turnaround + lead-in)
-//! between two calls. `InputBlock::first_frame` counts captured frames only. Continuous,
-//! gap-free streaming needs the driver's lower-level pump and is a phase 1 item.
+//! adapter runs ONE persistent worker per stream that loops such calls and re-reads its
+//! parameters (block size, generator, block sink) between calls, so parameter changes
+//! never stop the loop — see [`MeasurementDevice::update_stream`]. Samples inside one call
+//! are contiguous and sample-synchronous with the stimulus; there is a short gap (USB
+//! turnaround + lead-in) between two calls. `InputBlock::first_frame` counts captured
+//! frames only and restarts at 0 when the block sink is replaced.
+//!
+//! **Stopping always drains.** The stop flag is only observed between calls; the call in
+//! flight runs to completion. Cancelling an in-flight capture early in a stream cycle was
+//! measured to leave a QA402 (fw 60) in a persistent state where DAC data shows up inside
+//! the ADC stream until the unit is power-cycled — see
+//! `drivers/qa40x-driver/docs/qa402-dac-data-after-early-cancel.md`. The worst-case stop
+//! latency is one call: `MAX_CHUNK_FRAMES` at the current sample rate.
 //!
 //! Round-trip latency: the driver returns the capture window aligned on the *start of the
 //! stimulus*, so the first `L` samples of every call are the previous silence and the last
 //! `L` samples of the stimulus never come back. When generating, the adapter measures `L`
-//! once at stream start (a short burst, first sample above threshold), then pads every
-//! stimulus with `L` trailing zeros and drops the first `L` captured samples, so each block
-//! is pure, aligned stimulus response.
+//! once (a short chirp, cross-correlated), then pads every stimulus with `L` trailing
+//! zeros and drops the first `L` captured samples, so each block is pure, aligned
+//! stimulus response. The probe runs lazily: at the first iteration that generates.
 
 use crate::backends::blocker::Blocker;
+use crate::traits::StreamUpdate;
 use crate::{
     AppliedConfig, BackendKind, Calibration, Capabilities, DeviceBackend, DeviceConfig,
     DeviceDescriptor, DeviceError, DeviceId, Direction, InputBlock, LatencyInfo, MeasurementDevice,
@@ -36,6 +46,7 @@ use tokio::task::JoinHandle;
 /// between two half-duplex calls.
 pub const CHUNK_FRAMES: usize = 8192;
 /// Upper bound of a single call (USB queue depth / memory); 2^18 frames ≈ 5.5 s at 48 kHz.
+/// Also the worst-case drain-stop latency, in frames.
 pub const MAX_CHUNK_FRAMES: usize = 1 << 18;
 /// Chirp used to measure the round-trip latency at stream start (peak, full scale = 1).
 const LATENCY_PROBE_PEAK: f32 = 0.1;
@@ -201,9 +212,19 @@ impl DeviceBackend for Qa40xBackend {
             state: Mutex::new(State::default()),
             offsets_dbv: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
             measured_latency: Arc::new(std::sync::Mutex::new(None)),
-            insertions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }))
     }
+}
+
+/// Parameters a running worker re-reads between calls. `update_stream` writes them; the
+/// worker applies them at the next iteration boundary — the loop itself never stops.
+struct LiveParams {
+    block_frames: u32,
+    generate: bool,
+    /// A pending generator swap: `Some(None)` silences the outputs.
+    pending_source: Option<Option<Box<dyn OutputSource>>>,
+    /// A pending block-sink swap (a new logical stream over the same device loop).
+    pending_sender: Option<mpsc::Sender<InputBlock>>,
 }
 
 #[derive(Default)]
@@ -215,7 +236,8 @@ struct State {
 
 struct Running {
     handle: StreamHandle,
-    cancel: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    params: Arc<std::sync::Mutex<LiveParams>>,
     task: JoinHandle<()>,
 }
 
@@ -226,10 +248,8 @@ pub struct Qa40xDevice {
     /// (input, output) dBV offsets for the applied ranges; cached because `scale` is sync,
     /// shared with the stream worker which stamps every block with the input offset.
     offsets_dbv: Arc<std::sync::Mutex<(f32, f32)>>,
-    /// Round-trip latency measured at the last generating stream start, in frames.
+    /// Round-trip latency measured by the last chirp probe, in frames.
     measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
-    /// Captures discarded because they carried inserted stimulus data.
-    insertions: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Qa40xDevice {
@@ -241,12 +261,6 @@ impl std::fmt::Debug for Qa40xDevice {
 }
 
 impl Qa40xDevice {
-    /// Number of captures discarded so far because the device returned stimulus data
-    /// inside the ADC stream (seen on a QA402, fw 60, in a degraded state cleared by a USB power cycle).
-    pub fn discarded_captures(&self) -> u64 {
-        self.insertions.load(Ordering::Relaxed)
-    }
-
     fn range_dbv(ranges: &[Range], idx: Option<usize>, default: usize) -> Result<i32> {
         let i = idx.unwrap_or(default);
         ranges
@@ -338,28 +352,37 @@ impl MeasurementDevice for Qa40xDevice {
         let applied = st.applied.clone().ok_or(DeviceError::NotConfigured)?;
         let handle = StreamHandle(st.next_handle);
         st.next_handle += 1;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let params = Arc::new(std::sync::Mutex::new(LiveParams {
+            block_frames: cfg.block_frames.max(1),
+            generate: cfg.generate,
+            pending_source: Some(output),
+            pending_sender: Some(input),
+        }));
 
         let worker = Worker {
             handle: self.handle.clone(),
             applied,
-            blocker: Blocker::new(2, cfg.block_frames.max(1), input),
-            cfg,
-            source: output,
-            cancel: cancel.clone(),
+            capture: cfg.capture,
+            params: params.clone(),
+            stop: stop.clone(),
             measured_latency: self.measured_latency.clone(),
             offsets_dbv: self.offsets_dbv.clone(),
-            insertions: self.insertions.clone(),
         };
         let task = tokio::spawn(worker.run());
         st.running = Some(Running {
             handle,
-            cancel,
+            stop,
+            params,
             task,
         });
         Ok(handle)
     }
 
+    /// Drains: the stop flag is observed between calls only, the in-flight call always
+    /// completes (worst case `MAX_CHUNK_FRAMES` at the sample rate). Cancelling USB
+    /// transfers early in a stream cycle corrupts a QA402 persistently — see the module
+    /// documentation.
     async fn stop(&self, handle: StreamHandle) -> Result<()> {
         let running = {
             let mut st = self.state.lock().await;
@@ -370,8 +393,31 @@ impl MeasurementDevice for Qa40xDevice {
             }
         };
         if let Some(r) = running {
-            r.cancel.store(true, Ordering::SeqCst);
+            r.stop.store(true, Ordering::SeqCst);
             let _ = r.task.await;
+        }
+        Ok(())
+    }
+
+    /// Reconfigure the running stream between two calls: the persistent loop picks the new
+    /// block size / generator / block sink up at its next iteration and never stops.
+    async fn update_stream(&self, handle: StreamHandle, update: StreamUpdate) -> Result<()> {
+        let st = self.state.lock().await;
+        let running = st
+            .running
+            .as_ref()
+            .filter(|r| r.handle == handle)
+            .ok_or(DeviceError::NoSuchStream)?;
+        let mut p = running.params.lock().unwrap();
+        if let Some(b) = update.block_frames {
+            p.block_frames = b.max(1);
+        }
+        if let Some(source) = update.output {
+            p.generate = source.is_some();
+            p.pending_source = Some(source);
+        }
+        if let Some(tx) = update.input {
+            p.pending_sender = Some(tx);
         }
         Ok(())
     }
@@ -396,37 +442,18 @@ impl MeasurementDevice for Qa40xDevice {
     /// Range write between two capture chunks: the worker only holds the device mutex
     /// during `generate_and_capture`, so this waits for the current chunk, writes the range
     /// (the driver handles the attenuator-out quirk) and refreshes the cached dBV offset.
+    ///
+    /// **Warning (measured on a QA402 fw 60):** writing the input range while the stream
+    /// loop is running puts the device into a persistent corrupted state — see the module
+    /// documentation. Callers must stop the stream first; this method stays for the
+    /// stop-write-restart sequence, which was measured safe.
     async fn set_input_range(&self, index: usize) -> Result<()> {
         let caps = &self.descriptor.capabilities;
         let dbv = Self::range_dbv(&caps.input_ranges, Some(index), 0)?;
         let gain = InputGain::from_dbv(dbv)
             .ok_or_else(|| DeviceError::UnsupportedConfig(format!("input range {dbv} dBV")))?;
         let dev = self.handle.lock().await;
-        // Diagnostic hook (E10): hold the device for a while *before* a live range write
-        // (i.e. after the previous chunk's STREAM_STOP).
-        if let Some(ms) = std::env::var("ANECHO_QA40X_RANGE_PREPAUSE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
         dev.set_input_gain(gain).await.map_err(map_qerr)?;
-        // Diagnostic hook (E17): a short silent capture right after a live write.
-        if std::env::var_os("ANECHO_QA40X_RANGE_SILENT_CAPTURE").is_some() {
-            dev.acquire_data(4096).await.map_err(map_qerr)?;
-        }
-        // Diagnostic hook (E14): clear the data endpoints' halt state after a live write.
-        if std::env::var_os("ANECHO_QA40X_RANGE_CLEAR_HALT").is_some() {
-            dev.clear_data_endpoints().await.map_err(map_qerr)?;
-        }
-        // Diagnostic hook (E8): hold the device — and therefore the stream worker — for a
-        // while after a live range write.
-        if let Some(ms) = std::env::var("ANECHO_QA40X_RANGE_PAUSE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
         let (in_off, _) = dev.input_dbv_offset(Channel::Left).await;
         drop(dev);
         self.offsets_dbv.lock().unwrap().0 = in_off;
@@ -441,81 +468,11 @@ impl MeasurementDevice for Qa40xDevice {
 struct Worker {
     handle: DeviceHandle,
     applied: AppliedConfig,
-    cfg: StreamConfig,
-    source: Option<Box<dyn OutputSource>>,
-    blocker: Blocker,
-    cancel: Arc<AtomicBool>,
+    capture: bool,
+    params: Arc<std::sync::Mutex<LiveParams>>,
+    stop: Arc<AtomicBool>,
     measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
     offsets_dbv: Arc<std::sync::Mutex<(f32, f32)>>,
-    /// Captures discarded because they carried inserted stimulus data.
-    insertions: Arc<std::sync::atomic::AtomicU64>,
-}
-
-/// Quantised key of a sample for stimulus matching: the top 24 bits of its i32 form,
-/// which survive the DAC encode / ADC decode round trip of an inserted (digital) copy.
-#[inline]
-fn tx_key(v: f32) -> i32 {
-    ((v.clamp(-1.0, 1.0) as f64 * 2_147_483_648.0) as i32) >> 8
-}
-
-/// Length of the exact-match window used to recognise inserted stimulus data.
-const INSERTION_WINDOW: usize = 4;
-/// Ignore windows that are all (near) zero: silence matches silence trivially.
-const INSERTION_MIN_KEY: i32 = 1 << 4;
-/// Captures found to contain inserted stimulus data are redone up to this many times.
-const INSERTION_RETRIES: usize = 3;
-
-/// Exact zeros in a row that cannot come from an ADC (its noise floor never yields
-/// 32 consecutive exact zeros) — inserted DAC lead-in / padding.
-const INSERTION_ZERO_RUN: usize = 32;
-
-/// Set of every `INSERTION_WINDOW`-sample window of the given stimulus buffers (the
-/// current call's left and right channels and the previous call's, whose tail the
-/// device may still hold in its DAC FIFO).
-fn tx_windows(buffers: &[&[f32]]) -> std::collections::HashSet<[i32; INSERTION_WINDOW]> {
-    let mut set = std::collections::HashSet::new();
-    for tx in buffers {
-        let keys: Vec<i32> = tx.iter().map(|&v| tx_key(v)).collect();
-        set.extend(
-            keys.windows(INSERTION_WINDOW)
-                .filter(|w| w.iter().any(|k| k.abs() >= INSERTION_MIN_KEY))
-                .map(|w| [w[0], w[1], w[2], w[3]]),
-        );
-    }
-    set
-}
-
-/// Number of captured windows that are bit-exact copies of stimulus windows.
-///
-/// QA402 (fw 60) sometimes returns 1 KiB of the DAC stream every 20 KiB of ADC data
-///. A real loopback never reproduces the digital stimulus to 24
-/// bits, so any exact window is an inserted one.
-fn inserted_windows(
-    captured: &[f32],
-    tx: &std::collections::HashSet<[i32; INSERTION_WINDOW]>,
-) -> usize {
-    let keys: Vec<i32> = captured.iter().map(|&v| tx_key(v)).collect();
-    let matches = if tx.is_empty() {
-        0
-    } else {
-        keys.windows(INSERTION_WINDOW)
-            .filter(|w| tx.contains(&[w[0], w[1], w[2], w[3]]))
-            .count()
-    };
-    // Runs of exact zeros (raw i32 == 0): inserted silence from the DAC stream.
-    let mut zero_runs = 0;
-    let mut run = 0usize;
-    for &v in captured {
-        if v == 0.0 {
-            run += 1;
-            if run == INSERTION_ZERO_RUN {
-                zero_runs += 1;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    matches + zero_runs
 }
 
 /// Linear chirp, `LATENCY_CHIRP_FRAMES` long, zero-padded to `LATENCY_PROBE_FRAMES`.
@@ -561,10 +518,10 @@ fn best_lag(reference: &[f32], captured: &[f32], max_lag: usize) -> Option<usize
     (peak > 0.0 && peak > LATENCY_PEAK_TO_MEAN * mean).then_some(best)
 }
 
-/// Send a short chirp on the driven channels and measure when it comes back.
+/// Send a short chirp on the driven channels and measure when it comes back. A plain,
+/// uncancellable capture like any other.
 async fn probe_latency(
     handle: &DeviceHandle,
-    cancel: Option<&AtomicBool>,
     sample_rate: u32,
     drive_l: bool,
     drive_r: bool,
@@ -583,10 +540,9 @@ async fn probe_latency(
     let zero = vec![0f32; LATENCY_PROBE_FRAMES];
     let dev = handle.lock().await;
     let audio = dev
-        .generate_and_capture_cancellable(
+        .generate_and_capture(
             if drive_l { &chirp } else { &zero },
             if drive_r { &chirp } else { &zero },
-            cancel,
         )
         .await
         .ok()?;
@@ -605,73 +561,81 @@ async fn probe_latency(
 }
 
 impl Worker {
-    async fn run(mut self) {
+    async fn run(self) {
         let sr = self.applied.sample_rate;
-        let mut source: Box<dyn OutputSource> = self
-            .source
-            .take()
-            .unwrap_or_else(|| Box::new(crate::traits::Silence));
         let drive_l = self.applied.output_channels.contains(&0);
         let drive_r = self.applied.output_channels.contains(&1);
         let cap_l = self.applied.input_channels.contains(&0);
         let cap_r = self.applied.input_channels.contains(&1);
 
-        // Latency compensation only matters when we drive the outputs.
-        let offsets = *self.offsets_dbv.lock().unwrap();
-        // Diagnostic hook (E18): skip the latency probe at stream start.
-        let skip_probe = std::env::var_os("ANECHO_QA40X_SKIP_LATENCY_PROBE").is_some();
-        // Diagnostic hook (E22): stop never cancels the in-flight call; the worker only
-        // checks the stop flag between calls, so every USB transaction runs to completion.
-        let drain_stop = std::env::var_os("ANECHO_QA40X_DRAIN_STOP").is_some();
-        let call_cancel = if drain_stop { None } else { Some(&self.cancel) };
-        let call_cancel: Option<&AtomicBool> = call_cancel.map(|c| c.as_ref());
-        let pad = if self.cfg.generate && (drive_l || drive_r) && !skip_probe {
-            match probe_latency(
-                &self.handle,
-                call_cancel,
-                self.applied.sample_rate,
-                drive_l,
-                drive_r,
-                offsets,
-            )
-            .await
+        let mut source: Box<dyn OutputSource> = Box::new(crate::traits::Silence);
+        let mut generate;
+        let mut blocker: Option<Blocker> = None;
+        let mut block: usize = 0;
+        let mut chunk: usize = 0;
+        // Latency compensation, measured lazily at the first generating iteration.
+        let mut pad: Option<usize> = None;
+        let mut inter: Vec<f32> = Vec::new();
+        let mut left: Vec<f32> = Vec::new();
+        let mut right: Vec<f32> = Vec::new();
+
+        while !self.stop.load(Ordering::Relaxed) {
+            // Apply pending parameter changes between calls — the loop never stops for them.
             {
-                Some(l) => {
-                    log::info!("qa40x round-trip latency: {l} frames");
-                    *self.measured_latency.lock().unwrap() = Some(l);
-                    l
+                let mut p = self.params.lock().unwrap();
+                let new_block = p.block_frames.max(1) as usize;
+                let new_sender = p.pending_sender.take();
+                if let Some(src) = p.pending_source.take() {
+                    source = src.unwrap_or_else(|| Box::new(crate::traits::Silence));
                 }
-                None => {
-                    log::warn!(
-                        "qa40x latency probe found no loopback signal; blocks are not latency-aligned"
-                    );
-                    0
+                generate = p.generate;
+                drop(p);
+                if new_sender.is_some() || new_block != block {
+                    let tx = match (new_sender, blocker.take()) {
+                        (Some(tx), _) => tx,
+                        (None, Some(b)) => b.into_sender(),
+                        (None, None) => return, // unreachable: start() always sets a sender
+                    };
+                    block = new_block;
+                    chunk = if block <= CHUNK_FRAMES {
+                        CHUNK_FRAMES
+                    } else {
+                        block.min(MAX_CHUNK_FRAMES)
+                    };
+                    blocker = Some(Blocker::new(2, block as u32, tx));
+                    inter = vec![0f32; chunk * 2];
                 }
             }
-        } else {
-            0
-        };
-        if self.cancel.load(Ordering::Relaxed) {
-            return;
-        }
+            let Some(blk) = blocker.as_mut() else { return };
+            if blk.is_closed() {
+                return;
+            }
 
-        // One chunk per requested block (rounded up to the default), so a block never
-        // contains a chunk boundary.
-        let block = self.cfg.block_frames.max(1) as usize;
-        let chunk = if block <= CHUNK_FRAMES {
-            CHUNK_FRAMES
-        } else {
-            block.min(MAX_CHUNK_FRAMES)
-        };
-        let mut inter = vec![0f32; chunk * 2];
-        let mut left = vec![0f32; chunk + pad];
-        let mut right = vec![0f32; chunk + pad];
-        let mut prev_left: Vec<f32> = Vec::new();
-        let mut prev_right: Vec<f32> = Vec::new();
+            if generate && pad.is_none() && (drive_l || drive_r) {
+                let offsets = *self.offsets_dbv.lock().unwrap();
+                pad = match probe_latency(&self.handle, sr, drive_l, drive_r, offsets).await {
+                    Some(l) => {
+                        log::info!("qa40x round-trip latency: {l} frames");
+                        *self.measured_latency.lock().unwrap() = Some(l);
+                        Some(l)
+                    }
+                    None => {
+                        log::warn!(
+                            "qa40x latency probe found no loopback signal; blocks are not latency-aligned"
+                        );
+                        Some(0)
+                    }
+                };
+                if self.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+            let pad_frames = pad.unwrap_or(0);
+            left.resize(chunk + pad_frames, 0.0);
+            right.resize(chunk + pad_frames, 0.0);
 
-        while !self.cancel.load(Ordering::Relaxed) && !self.blocker.is_closed() {
             inter.iter_mut().for_each(|s| *s = 0.0);
-            if self.cfg.generate {
+            if generate {
                 source.fill(&mut inter, 2, sr);
             }
             for (i, fr) in inter.as_chunks::<2>().0.iter().enumerate() {
@@ -681,57 +645,25 @@ impl Worker {
             // Trailing zeros: the stimulus tail must have time to come back.
             left[chunk..].iter_mut().for_each(|s| *s = 0.0);
             right[chunk..].iter_mut().for_each(|s| *s = 0.0);
+
             // The device mutex stays held until the chunk's blocks are handed over: a range
-            // write waiting on the mutex (`set_input_range`) then always lands *between* the
-            // blocks of two chunks, so every block is captured entirely on one range.
-            // Captures carrying inserted stimulus data are redone; the
-            // mutex is released between attempts so a pending range write can land.
-            let tx = if self.cfg.generate {
-                tx_windows(&[&left, &right, &prev_left, &prev_right])
-            } else {
-                Default::default()
-            };
-            let mut captured = None;
-            for attempt in 0..INSERTION_RETRIES {
-                let dev = self.handle.lock().await;
-                let res = dev
-                    .generate_and_capture_cancellable(&left, &right, call_cancel)
-                    .await;
-                match res {
-                    Ok(a) => {
-                        let hits = inserted_windows(&a.left_channel, &tx);
-                        if hits == 0 || attempt + 1 == INSERTION_RETRIES {
-                            if hits > 0 {
-                                log::warn!(
-                                    "qa40x: stimulus data inserted in the capture ({hits} windows), kept after {INSERTION_RETRIES} attempts"
-                                );
-                            }
-                            captured = Some((dev, a));
-                            break;
-                        }
-                        log::info!(
-                            "qa40x: stimulus data inserted in the capture ({hits} windows), retrying"
-                        );
-                        self.insertions.fetch_add(1, Ordering::Relaxed);
-                        drop(dev);
-                    }
-                    Err(e) => {
-                        if !self.cancel.load(Ordering::Relaxed) {
-                            log::warn!("qa40x capture failed: {e}");
-                        }
-                        break;
-                    }
+            // write waiting on the mutex (`set_input_range`) then always lands *between*
+            // two chunks, so every block is captured entirely on one range. The call is
+            // NEVER cancelled: stopping waits for it (drain).
+            let dev = self.handle.lock().await;
+            let audio = match dev.generate_and_capture(&left, &right).await {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!("qa40x capture failed: {e}");
+                    return;
                 }
-            }
-            let Some((dev, audio)) = captured else { break };
-            prev_left.clone_from(&left);
-            prev_right.clone_from(&right);
-            if !self.cfg.capture {
+            };
+            if !self.capture {
                 drop(dev);
                 continue;
             }
             let n = audio.left_channel.len().min(audio.right_channel.len());
-            let start = pad.min(n);
+            let start = pad_frames.min(n);
             let end = (start + chunk).min(n);
             let mut out = Vec::with_capacity((end - start) * 2);
             for i in start..end {
@@ -740,8 +672,8 @@ impl Worker {
             }
             // Stamp the blocks with the input offset the chunk was captured under.
             let in_off = self.offsets_dbv.lock().unwrap().0;
-            self.blocker.set_scale(Scale::Volts { dbv_offset: in_off });
-            self.blocker.push(&out);
+            blk.set_scale(Scale::Volts { dbv_offset: in_off });
+            blk.push(&out);
             drop(dev);
         }
     }
@@ -780,37 +712,5 @@ mod tests {
             .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5)
             .collect();
         assert_eq!(best_lag(&chirp, &noise, LATENCY_MAX_FRAMES), None);
-    }
-}
-
-#[cfg(test)]
-mod insertion_tests {
-    use super::*;
-
-    #[test]
-    fn detects_only_exact_stimulus_copies() {
-        let tx: Vec<f32> = (0..4096)
-            .map(|i| 0.3 * (std::f32::consts::TAU * 1000.0 * i as f32 / 48000.0).sin())
-            .collect();
-        let set = tx_windows(&[&tx]);
-        // A real loopback: same tone, scaled and shifted — no exact windows.
-        let real: Vec<f32> = (0..4096)
-            .map(|i| {
-                0.2371 * (std::f32::consts::TAU * 1000.0 * (i as f32 + 46.3) / 48000.0).sin() + 1e-5
-            })
-            .collect();
-        assert_eq!(inserted_windows(&real, &set), 0);
-        // The DAC round trip: encode to i32 (2^31-1 scale), decode by 2^31 — still exact.
-        let mut corrupted = real.clone();
-        for i in 1000..1128 {
-            let q = (tx[i + 7] * 2_147_483_647.0) as i32;
-            corrupted[i] = q as f32 / 2_147_483_648.0;
-        }
-        assert!(inserted_windows(&corrupted, &set) >= 100);
-        // Real silence is never exactly zero for long; inserted DAC silence is.
-        assert_eq!(inserted_windows(&real, &Default::default()), 0);
-        let mut zeros = real.clone();
-        zeros[500..600].iter_mut().for_each(|v| *v = 0.0);
-        assert_eq!(inserted_windows(&zeros, &Default::default()), 1);
     }
 }

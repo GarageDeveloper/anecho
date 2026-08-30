@@ -97,6 +97,15 @@ impl Blocker {
         self.tx
     }
 
+    /// A clone of the sender the blocks go to.
+    pub fn sender(&self) -> mpsc::Sender<InputBlock> {
+        self.tx.clone()
+    }
+
+    pub fn block_frames(&self) -> u32 {
+        self.block_frames as u32
+    }
+
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }

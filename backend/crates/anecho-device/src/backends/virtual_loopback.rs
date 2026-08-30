@@ -3,6 +3,7 @@
 //! stack can be exercised without hardware, cpal or the QA40x simulator.
 
 use crate::backends::blocker::Blocker;
+use crate::traits::StreamUpdate;
 use crate::{
     AppliedConfig, BackendKind, Calibration, Capabilities, DeviceBackend, DeviceConfig,
     DeviceDescriptor, DeviceError, DeviceId, Direction, InputBlock, LatencyInfo, MeasurementDevice,
@@ -105,9 +106,18 @@ struct State {
     next_handle: u64,
 }
 
+/// Parameters the worker re-reads between blocks; `update_stream` writes them.
+struct LiveParams {
+    block_frames: u32,
+    generate: bool,
+    pending_source: Option<Option<Box<dyn OutputSource>>>,
+    pending_sender: Option<mpsc::Sender<InputBlock>>,
+}
+
 struct Running {
     handle: StreamHandle,
     stop: Arc<AtomicBool>,
+    params: Arc<Mutex<LiveParams>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -181,19 +191,18 @@ impl MeasurementDevice for VirtualLoopbackDevice {
         let handle = StreamHandle(st.next_handle);
         st.next_handle += 1;
 
-        let blocker = Blocker::new(self.options.channels, cfg_block_frames(&cfg), input);
-        let blocker = if self.options.realtime {
-            blocker
-        } else {
-            blocker.blocking()
-        };
+        let params = Arc::new(Mutex::new(LiveParams {
+            block_frames: cfg_block_frames(&cfg),
+            generate: cfg.generate,
+            pending_source: Some(output),
+            pending_sender: Some(input),
+        }));
         let worker = Worker {
             options: self.options.clone(),
             sample_rate: applied.sample_rate,
             channels: self.options.channels,
-            cfg,
-            source: output,
-            blocker,
+            capture: cfg.capture,
+            params: params.clone(),
             stop: stop.clone(),
         };
         let thread = std::thread::Builder::new()
@@ -203,6 +212,7 @@ impl MeasurementDevice for VirtualLoopbackDevice {
         st.running = Some(Running {
             handle,
             stop,
+            params,
             thread: Some(thread),
         });
         Ok(handle)
@@ -226,6 +236,27 @@ impl MeasurementDevice for VirtualLoopbackDevice {
         Ok(())
     }
 
+    async fn update_stream(&self, handle: StreamHandle, update: StreamUpdate) -> Result<()> {
+        let st = self.state.lock().unwrap();
+        let running = st
+            .running
+            .as_ref()
+            .filter(|r| r.handle == handle)
+            .ok_or(DeviceError::NoSuchStream)?;
+        let mut p = running.params.lock().unwrap();
+        if let Some(b) = update.block_frames {
+            p.block_frames = b.max(1);
+        }
+        if let Some(source) = update.output {
+            p.generate = source.is_some();
+            p.pending_source = Some(source);
+        }
+        if let Some(tx) = update.input {
+            p.pending_sender = Some(tx);
+        }
+        Ok(())
+    }
+
     fn scale(&self, _direction: Direction) -> Scale {
         Scale::Dbfs
     }
@@ -242,35 +273,64 @@ struct Worker {
     options: LoopbackOptions,
     sample_rate: u32,
     channels: u16,
-    cfg: StreamConfig,
-    source: Option<Box<dyn OutputSource>>,
-    blocker: Blocker,
+    capture: bool,
+    params: Arc<Mutex<LiveParams>>,
     stop: Arc<AtomicBool>,
 }
 
 impl Worker {
-    fn run(mut self) {
+    fn run(self) {
         let ch = self.channels as usize;
-        let block_frames = self.cfg.block_frames.max(1) as usize;
-        let mut blocker = self.blocker;
-
         let gain = 10f32.powf(self.options.gain_db / 20.0);
         let delay = self.options.latency_frames as usize * ch;
-        let mut line = vec![0f32; delay + block_frames * ch];
-        let mut out = vec![0f32; block_frames * ch];
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        let mut source = self
-            .source
-            .take()
-            .unwrap_or_else(|| Box::new(crate::traits::Silence));
 
-        let block_dur = Duration::from_secs_f64(block_frames as f64 / self.sample_rate as f64);
+        let mut source: Box<dyn OutputSource> = Box::new(crate::traits::Silence);
+        let mut generate;
+        let mut blocker: Option<Blocker> = None;
+        let mut block_frames: usize = 0;
+        let mut line: Vec<f32> = Vec::new();
+        let mut out: Vec<f32> = Vec::new();
+
         let start = Instant::now();
-        let mut n: u64 = 0;
+        let mut elapsed_frames: u64 = 0;
 
-        while !self.stop.load(Ordering::Relaxed) && !blocker.is_closed() {
+        while !self.stop.load(Ordering::Relaxed) {
+            // Apply pending parameter changes between blocks; the loop never stops.
+            {
+                let mut p = self.params.lock().unwrap();
+                let new_block = p.block_frames.max(1) as usize;
+                let new_sender = p.pending_sender.take();
+                if let Some(src) = p.pending_source.take() {
+                    source = src.unwrap_or_else(|| Box::new(crate::traits::Silence));
+                }
+                generate = p.generate;
+                drop(p);
+                if new_sender.is_some() || new_block != block_frames {
+                    let tx = match (new_sender, blocker.take()) {
+                        (Some(tx), _) => tx,
+                        (None, Some(b)) => b.into_sender(),
+                        (None, None) => return,
+                    };
+                    block_frames = new_block;
+                    let b = Blocker::new(self.channels, block_frames as u32, tx);
+                    blocker = Some(if self.options.realtime {
+                        b
+                    } else {
+                        b.blocking()
+                    });
+                    line = vec![0f32; delay + block_frames * ch];
+                    out = vec![0f32; block_frames * ch];
+                }
+            }
+            let Some(blocker) = blocker.as_mut() else {
+                return;
+            };
+            if blocker.is_closed() {
+                return;
+            }
             out.iter_mut().for_each(|s| *s = 0.0);
-            if self.cfg.generate {
+            if generate {
                 source.fill(&mut out, self.channels, self.sample_rate);
             }
             // Delay line: append the new output, read what was written `delay` samples ago.
@@ -287,12 +347,13 @@ impl Worker {
                     *s += (u * 2.0 - 1.0) * self.options.noise_peak;
                 }
             }
-            if self.cfg.capture {
+            if self.capture {
                 blocker.push(&captured);
             }
-            n += 1;
+            elapsed_frames += block_frames as u64;
             if self.options.realtime {
-                let due = start + block_dur * n as u32;
+                let due = start
+                    + Duration::from_secs_f64(elapsed_frames as f64 / self.sample_rate as f64);
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }

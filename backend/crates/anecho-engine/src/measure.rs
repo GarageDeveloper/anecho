@@ -2,7 +2,7 @@
 
 use crate::generator::{GeneratorSpec, Signal};
 use crate::{Engine, EngineError, Result};
-use anecho_device::{DeviceError, Direction, InputBlock, Scale, StreamConfig};
+use anecho_device::{DeviceConfig, DeviceError, Direction, InputBlock, Scale, StreamConfig};
 use anecho_dsp::{Averager, Averaging, Imd, RealSpectrum, Thd, ThdOptions, Window};
 use tokio::sync::mpsc;
 
@@ -137,10 +137,36 @@ impl Engine {
                 _ => (60.0, 7000.0),
             },
         };
+        // A dBV level may need another output range; the session holds no stream while
+        // measuring, so the device is idle and the range write is safe.
+        let mut applied = applied.clone();
+        if let Some(spec) = &req.generator
+            && let Some(idx) = Self::output_range_for(device, spec)?
+            && applied.output_range != Some(idx)
+        {
+            device
+                .configure(DeviceConfig {
+                    sample_rate: applied.sample_rate,
+                    input_range: applied.input_range,
+                    output_range: Some(idx),
+                    input_channels: applied.input_channels.clone(),
+                    output_channels: applied.output_channels.clone(),
+                    auto_range_input: false,
+                })
+                .await?;
+            applied = device
+                .applied_config()
+                .await
+                .ok_or(DeviceError::NotConfigured)?;
+            let _ = self.events.send(crate::Event::RangeChanged {
+                session_id,
+                input_range: None,
+                output_range: Some(idx),
+            });
+        }
+        let applied = &applied;
         let output = match req.generator.clone() {
-            Some(spec) => Some(
-                Self::resolve_generator(session_id, device, applied, spec, &self.events).await?,
-            ),
+            Some(spec) => Some(Self::build_generator(device, applied, spec)?),
             None => None,
         };
         let (tx, mut rx) = mpsc::channel::<InputBlock>(8);

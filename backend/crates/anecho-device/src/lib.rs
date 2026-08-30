@@ -18,7 +18,7 @@ pub mod types;
 
 pub use error::DeviceError;
 pub use registry::DeviceRegistry;
-pub use traits::{DeviceBackend, MeasurementDevice, OutputSource};
+pub use traits::{DeviceBackend, MeasurementDevice, OutputSource, StreamUpdate};
 pub use types::*;
 
 /// Convenience alias used throughout the crate.

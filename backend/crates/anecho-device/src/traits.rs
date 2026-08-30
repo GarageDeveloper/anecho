@@ -17,6 +17,31 @@ pub trait OutputSource: Send {
 #[derive(Debug, Default)]
 pub struct Silence;
 
+/// In-place changes to a running stream, applied by the backend **between** capture
+/// blocks — the device loop never stops for them. Every field is optional; `None` leaves
+/// the current value.
+#[derive(Default)]
+pub struct StreamUpdate {
+    /// New size of the emitted [`InputBlock`]s. The block/frame counters restart at 0.
+    pub block_frames: Option<u32>,
+    /// Replace the output source: `Some(None)` silences the outputs, `Some(Some(_))`
+    /// swaps the generator.
+    pub output: Option<Option<Box<dyn OutputSource>>>,
+    /// Replace the block sink (a new logical stream over the same device loop). The
+    /// previous sender is dropped, ending its receiver's stream of blocks.
+    pub input: Option<mpsc::Sender<InputBlock>>,
+}
+
+impl std::fmt::Debug for StreamUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamUpdate")
+            .field("block_frames", &self.block_frames)
+            .field("output", &self.output.as_ref().map(|o| o.is_some()))
+            .field("input", &self.input.is_some())
+            .finish()
+    }
+}
+
 impl OutputSource for Silence {
     fn fill(&mut self, _buf: &mut [f32], _channels: u16, _sample_rate: u32) {}
 }
@@ -50,7 +75,21 @@ pub trait MeasurementDevice: Send + Sync {
     ) -> Result<StreamHandle>;
 
     /// Stop and release the stream. Idempotent for an already-stopped handle.
+    ///
+    /// Backends **drain**: an in-flight capture completes before the call returns.
+    /// Cancelling USB transfers early in a stream cycle was measured to corrupt a QA402
+    /// persistently (see the qa40x backend documentation), so no backend interrupts a
+    /// capture that has started.
     async fn stop(&self, handle: StreamHandle) -> Result<()>;
+
+    /// Reconfigure a running stream in place (block size, generator, block sink), applied
+    /// between capture blocks without stopping the device. Backends that cannot honour a
+    /// given update return `UnsupportedConfig`; callers then fall back to stop + start.
+    async fn update_stream(&self, _handle: StreamHandle, _update: StreamUpdate) -> Result<()> {
+        Err(DeviceError::UnsupportedConfig(
+            "this device cannot be reconfigured while streaming".into(),
+        ))
+    }
 
     /// How to convert samples of a given direction to absolute units, for the applied config.
     fn scale(&self, direction: Direction) -> Scale;

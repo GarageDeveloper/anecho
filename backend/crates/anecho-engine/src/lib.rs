@@ -12,7 +12,7 @@ pub use measure::{ChannelDistortion, MeasureKind, MeasureRequest, MeasureResult}
 
 use anecho_device::{
     DeviceConfig, DeviceDescriptor, DeviceError, DeviceId, DeviceRegistry, Direction, InputBlock,
-    MeasurementDevice, OutputSource, Scale, StreamConfig, StreamHandle,
+    MeasurementDevice, OutputSource, Scale, StreamConfig, StreamHandle, StreamUpdate,
 };
 pub use anecho_wire::Frame;
 use std::collections::HashMap;
@@ -230,15 +230,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Start a stream on the session. When the session already has one running, the new
+    /// stream **reuses the device's persistent capture loop**: the engine updates the block
+    /// size / generator / block sink in place ([`MeasurementDevice::update_stream`]) and
+    /// the device never stops — rapidly changing parameters therefore never cancels a
+    /// fresh capture (the sequence that corrupts a QA402, see the qa40x backend docs).
+    /// The previous stream ends (`StreamEnded`), the new one gets a fresh id.
+    ///
+    /// Exception: a generator whose dBV level needs another output range goes through the
+    /// stop → reconfigure → start path — range registers are only written while the
+    /// device is idle (measured safe).
     pub async fn start_stream(&self, session_id: u64, req: StreamRequest) -> Result<StreamInfo> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .ok_or(EngineError::NoSuchSession(session_id))?;
-        if session.stream.is_some() || session.measuring {
+        if session.measuring {
             return Err(EngineError::StreamRunning(session_id));
         }
-        let applied = session
+        let mut applied = session
             .device
             .applied_config()
             .await
@@ -260,12 +270,39 @@ impl Engine {
                 "device has no input channel".into(),
             ));
         }
-        // Resolve the generator first: a dBV level may re-configure the output range.
-        let output: Option<Box<dyn OutputSource>> = match req.generator {
-            Some(spec) => Some(
-                Self::resolve_generator(session_id, &session.device, &applied, spec, &self.events)
-                    .await?,
-            ),
+        // A dBV generator level may need another output range; range registers are only
+        // written while the device is idle, so that path stops the running stream first.
+        if let Some(spec) = &req.generator
+            && let Some(idx) = Self::output_range_for(&session.device, spec)?
+            && applied.output_range != Some(idx)
+        {
+            if let Some(rs) = session.stream.take() {
+                Self::teardown(&session.device, rs, &self.events).await;
+            }
+            session
+                .device
+                .configure(DeviceConfig {
+                    sample_rate: applied.sample_rate,
+                    input_range: applied.input_range,
+                    output_range: Some(idx),
+                    input_channels: applied.input_channels.clone(),
+                    output_channels: applied.output_channels.clone(),
+                    auto_range_input: false,
+                })
+                .await?;
+            applied = session
+                .device
+                .applied_config()
+                .await
+                .ok_or(DeviceError::NotConfigured)?;
+            let _ = self.events.send(Event::RangeChanged {
+                session_id,
+                input_range: None,
+                output_range: Some(idx),
+            });
+        }
+        let output: Option<Box<dyn OutputSource>> = match req.generator.clone() {
+            Some(spec) => Some(Self::build_generator(&session.device, &applied, spec)?),
             None => None,
         };
         let stream_id = {
@@ -336,18 +373,88 @@ impl Engine {
         };
 
         let (tx, rx) = mpsc::channel::<InputBlock>(64);
-        let handle = session
-            .device
-            .start(
-                StreamConfig {
-                    block_frames,
-                    capture: true,
-                    generate: output.is_some(),
-                },
-                tx,
-                output,
-            )
-            .await?;
+        let handle = if let Some(old) = session.stream.take() {
+            // Reuse the running device loop: swap block size, generator and sink in place.
+            match session
+                .device
+                .update_stream(
+                    old.handle,
+                    StreamUpdate {
+                        block_frames: Some(block_frames),
+                        output: Some(output),
+                        input: Some(tx),
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    // The worker drops the old sink at its next iteration; the old pump
+                    // then drains and ends.
+                    let _ = old.task.await;
+                    let _ = self.events.send(Event::StreamEnded {
+                        stream_id: old.info.stream_id,
+                    });
+                    old.handle
+                }
+                Err(DeviceError::UnsupportedConfig(_)) | Err(DeviceError::NoSuchStream) => {
+                    // The backend cannot morph this stream (e.g. a cpal stream started
+                    // without an output side): fall back to a drained stop + fresh start.
+                    // The generator source was consumed by the failed update; rebuild it.
+                    Self::teardown(&session.device, old, &self.events).await;
+                    let output: Option<Box<dyn OutputSource>> = match &req.generator {
+                        Some(spec) => Some(Self::build_generator(
+                            &session.device,
+                            &applied,
+                            spec.clone(),
+                        )?),
+                        None => None,
+                    };
+                    let (tx, rx2) = mpsc::channel::<InputBlock>(64);
+                    let handle = session
+                        .device
+                        .start(
+                            StreamConfig {
+                                block_frames,
+                                capture: true,
+                                generate: true,
+                            },
+                            tx,
+                            output,
+                        )
+                        .await?;
+                    let task = tokio::spawn(pump(
+                        rx2,
+                        stream_id,
+                        processor,
+                        self.frames.clone(),
+                        self.events.clone(),
+                    ));
+                    session.stream = Some(RunningStream {
+                        info: info.clone(),
+                        handle,
+                        task,
+                    });
+                    return Ok(info);
+                }
+                Err(e) => {
+                    Self::teardown(&session.device, old, &self.events).await;
+                    return Err(e.into());
+                }
+            }
+        } else {
+            session
+                .device
+                .start(
+                    StreamConfig {
+                        block_frames,
+                        capture: true,
+                        generate: true,
+                    },
+                    tx,
+                    output,
+                )
+                .await?
+        };
         let task = tokio::spawn(pump(
             rx,
             stream_id,
@@ -388,64 +495,65 @@ impl Engine {
         }
     }
 
-    /// Build the output source for a generator request. A dBV level picks the lowest output
-    /// range that carries the signal (crest factor included, 0.5 dB headroom), re-configures
-    /// the device if the range changes, then converts to a digital peak level.
-    async fn resolve_generator(
-        session_id: u64,
+    /// The output range a dBV generator level needs: the lowest range that carries the
+    /// signal (crest factor included, 0.5 dB headroom). `None` for dBFS levels or devices
+    /// without output ranges. Pure — no device I/O.
+    fn output_range_for(
+        device: &Arc<dyn MeasurementDevice>,
+        spec: &generator::GeneratorSpec,
+    ) -> Result<Option<usize>> {
+        let generator::GenLevel::DbvRms(dbv) = spec.level else {
+            return Ok(None);
+        };
+        let Scale::Volts { .. } = device.scale(Direction::Output) else {
+            return Err(DeviceError::UnsupportedConfig(
+                "a dBV level needs a factory-calibrated device; use peak_dbfs".into(),
+            )
+            .into());
+        };
+        let ranges = &device.capabilities().output_ranges;
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let crest_db =
+            generator::crest_factor_db(&spec.signal, device.capabilities().sample_rates[0]);
+        // A full-scale signal of crest c has RMS = full_scale_dbv + 3.01 − c.
+        let needed = dbv + crest_db - 3.0103 + 0.5;
+        let mut best: Option<(usize, f32)> = None;
+        for (i, r) in ranges.iter().enumerate() {
+            if (r.full_scale_dbv as f64) >= needed
+                && best.is_none_or(|(_, fs)| r.full_scale_dbv < fs)
+            {
+                best = Some((i, r.full_scale_dbv));
+            }
+        }
+        match best {
+            Some((idx, _)) => Ok(Some(idx)),
+            None => Err(DeviceError::UnsupportedConfig(format!(
+                "{dbv:.1} dBV RMS with a crest factor of {crest_db:.1} dB exceeds every output range"
+            ))
+            .into()),
+        }
+    }
+
+    /// Build the output source for a generator request. The output range must already fit
+    /// (see [`Self::output_range_for`]); a dBV level is converted with the current scale.
+    fn build_generator(
         device: &Arc<dyn MeasurementDevice>,
         applied: &anecho_device::AppliedConfig,
         spec: generator::GeneratorSpec,
-        events: &broadcast::Sender<Event>,
     ) -> Result<Box<dyn OutputSource>> {
         let sample_rate = applied.sample_rate;
         let level = match spec.level {
             generator::GenLevel::PeakDbfs(db) => generator::Level::Dbfs(db),
             generator::GenLevel::DbvRms(dbv) => {
-                let Scale::Volts { .. } = device.scale(Direction::Output) else {
+                let Scale::Volts { dbv_offset } = device.scale(Direction::Output) else {
                     return Err(DeviceError::UnsupportedConfig(
                         "a dBV level needs a factory-calibrated device; use peak_dbfs".into(),
                     )
                     .into());
                 };
                 let crest_db = generator::crest_factor_db(&spec.signal, sample_rate);
-                // A full-scale signal of crest c has RMS = full_scale_dbv + 3.01 − c.
-                let needed = dbv + crest_db - 3.0103 + 0.5;
-                let ranges = &device.capabilities().output_ranges;
-                let mut best: Option<(usize, f32)> = None;
-                for (i, r) in ranges.iter().enumerate() {
-                    if (r.full_scale_dbv as f64) >= needed
-                        && best.is_none_or(|(_, fs)| r.full_scale_dbv < fs)
-                    {
-                        best = Some((i, r.full_scale_dbv));
-                    }
-                }
-                let Some((idx, _)) = best else {
-                    return Err(DeviceError::UnsupportedConfig(format!(
-                        "{dbv:.1} dBV RMS with a crest factor of {crest_db:.1} dB exceeds every output range"
-                    ))
-                    .into());
-                };
-                if applied.output_range != Some(idx) {
-                    device
-                        .configure(DeviceConfig {
-                            sample_rate,
-                            input_range: applied.input_range,
-                            output_range: Some(idx),
-                            input_channels: applied.input_channels.clone(),
-                            output_channels: applied.output_channels.clone(),
-                            auto_range_input: false,
-                        })
-                        .await?;
-                    let _ = events.send(Event::RangeChanged {
-                        session_id,
-                        input_range: None,
-                        output_range: Some(idx),
-                    });
-                }
-                let Scale::Volts { dbv_offset } = device.scale(Direction::Output) else {
-                    unreachable!("checked above");
-                };
                 let rms_dbfs = dbv - dbv_offset as f64;
                 generator::Level::Dbfs(rms_dbfs + crest_db)
             }

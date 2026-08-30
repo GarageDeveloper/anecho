@@ -7,6 +7,7 @@
 //! thread that builds, plays and finally drops the cpal streams.
 
 use crate::backends::blocker::Blocker;
+use crate::traits::StreamUpdate;
 use crate::{
     AppliedConfig, BackendKind, Calibration, Capabilities, DeviceBackend, DeviceConfig,
     DeviceDescriptor, DeviceError, DeviceId, Direction, InputBlock, LatencyInfo, MeasurementDevice,
@@ -14,7 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
@@ -158,6 +159,13 @@ struct State {
 struct Running {
     handle: StreamHandle,
     stop: Arc<AtomicBool>,
+    /// Block size the input callback re-reads (live update).
+    block_frames: Arc<AtomicU32>,
+    /// Pending block-sink swap, picked up by the input callback.
+    pending_sender: Arc<Mutex<Option<mpsc::Sender<InputBlock>>>>,
+    /// The output callback's source, swappable while running. `None` when the stream was
+    /// built without an output side (a later generator swap is then unsupported).
+    source_slot: Option<Arc<Mutex<Box<dyn OutputSource>>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -232,10 +240,26 @@ impl MeasurementDevice for CpalDevice {
         let id = self.descriptor.id.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let stop2 = stop.clone();
+        let block_frames = Arc::new(AtomicU32::new(cfg.block_frames.max(1)));
+        let pending_sender: Arc<Mutex<Option<mpsc::Sender<InputBlock>>>> =
+            Arc::new(Mutex::new(None));
+        let source_slot: Option<Arc<Mutex<Box<dyn OutputSource>>>> =
+            if cfg.generate && caps.output_channels > 0 {
+                Some(Arc::new(Mutex::new(output.unwrap_or_else(|| {
+                    Box::new(crate::traits::Silence) as Box<dyn OutputSource>
+                }))))
+            } else {
+                None
+            };
+        let live = LiveWiring {
+            block_frames: block_frames.clone(),
+            pending_sender: pending_sender.clone(),
+            source_slot: source_slot.clone(),
+        };
         let thread = std::thread::Builder::new()
             .name("anecho-cpal-stream".into())
             .spawn(move || {
-                stream_thread(id, caps, applied, cfg, input, output, stop2, ready_tx);
+                stream_thread(id, caps, applied, cfg, input, live, stop2, ready_tx);
             })
             .map_err(DeviceError::Io)?;
 
@@ -256,6 +280,9 @@ impl MeasurementDevice for CpalDevice {
         self.state.lock().unwrap().running = Some(Running {
             handle,
             stop,
+            block_frames,
+            pending_sender,
+            source_slot,
             thread: Some(thread),
         });
         Ok(handle)
@@ -279,6 +306,32 @@ impl MeasurementDevice for CpalDevice {
         Ok(())
     }
 
+    async fn update_stream(&self, handle: StreamHandle, update: StreamUpdate) -> Result<()> {
+        let st = self.state.lock().unwrap();
+        let running = st
+            .running
+            .as_ref()
+            .filter(|r| r.handle == handle)
+            .ok_or(DeviceError::NoSuchStream)?;
+        if let Some(source) = update.output {
+            let Some(slot) = &running.source_slot else {
+                return Err(DeviceError::UnsupportedConfig(
+                    "this stream was started without an output side; restart to generate".into(),
+                ));
+            };
+            let new: Box<dyn OutputSource> =
+                source.unwrap_or_else(|| Box::new(crate::traits::Silence));
+            *slot.lock().unwrap() = new;
+        }
+        if let Some(b) = update.block_frames {
+            running.block_frames.store(b.max(1), Ordering::Relaxed);
+        }
+        if let Some(tx) = update.input {
+            *running.pending_sender.lock().unwrap() = Some(tx);
+        }
+        Ok(())
+    }
+
     fn scale(&self, _direction: Direction) -> Scale {
         Scale::Dbfs
     }
@@ -289,6 +342,13 @@ impl MeasurementDevice for CpalDevice {
             measured_frames: None,
         }
     }
+}
+
+/// Live wiring shared with the audio callbacks.
+struct LiveWiring {
+    block_frames: Arc<AtomicU32>,
+    pending_sender: Arc<Mutex<Option<mpsc::Sender<InputBlock>>>>,
+    source_slot: Option<Arc<Mutex<Box<dyn OutputSource>>>>,
 }
 
 fn expand(requested: Vec<u16>, available: u16) -> Result<Vec<u16>> {
@@ -310,7 +370,7 @@ fn stream_thread(
     applied: AppliedConfig,
     cfg: StreamConfig,
     input: mpsc::Sender<InputBlock>,
-    output: Option<Box<dyn OutputSource>>,
+    live: LiveWiring,
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::Sender<Result<()>>,
 ) {
@@ -329,6 +389,8 @@ fn stream_thread(
         let out_ch = sel.len() as u16;
         let mut blocker = Blocker::new(out_ch, cfg.block_frames, input);
         let mut scratch: Vec<f32> = Vec::new();
+        let block_frames = live.block_frames.clone();
+        let pending_sender = live.pending_sender.clone();
         let config = cpal::StreamConfig {
             channels: dev_ch,
             sample_rate,
@@ -337,6 +399,15 @@ fn stream_thread(
         let r = dev.build_input_stream(
             config,
             move |data: &[f32], _info| {
+                // Live updates: a new block size or sink rebuilds the blocker. Rebuilding
+                // allocates, which is not real-time-clean, but it only happens on an
+                // explicit parameter change.
+                let wanted = block_frames.load(Ordering::Relaxed).max(1);
+                let new_sender = pending_sender.try_lock().ok().and_then(|mut p| p.take());
+                if new_sender.is_some() || wanted != blocker.block_frames() {
+                    let tx = new_sender.unwrap_or_else(|| blocker.sender());
+                    blocker = Blocker::new(out_ch, wanted, tx);
+                }
                 if sel.len() == dev_ch as usize
                     && sel.iter().enumerate().all(|(i, &c)| i == c as usize)
                 {
@@ -361,12 +432,10 @@ fn stream_thread(
         }
     }
 
-    if cfg.generate && caps.output_channels > 0 {
+    if let Some(slot) = live.source_slot.clone() {
         let dev_ch = caps.output_channels;
         let sel = applied.output_channels.clone();
         let sel_ch = sel.len() as u16;
-        let mut source: Box<dyn OutputSource> =
-            output.unwrap_or_else(|| Box::new(crate::traits::Silence));
         let mut scratch: Vec<f32> = Vec::new();
         let config = cpal::StreamConfig {
             channels: dev_ch,
@@ -379,7 +448,11 @@ fn stream_thread(
                 let frames = data.len() / dev_ch as usize;
                 scratch.clear();
                 scratch.resize(frames * sel_ch as usize, 0.0);
-                source.fill(&mut scratch, sel_ch, sample_rate);
+                // The source lives behind a mutex so it can be swapped while running; the
+                // RT callback never blocks on it — on contention this callback is silent.
+                if let Ok(mut source) = slot.try_lock() {
+                    source.fill(&mut scratch, sel_ch, sample_rate);
+                }
                 data.iter_mut().for_each(|s| *s = 0.0);
                 for (f, frame) in data.chunks_exact_mut(dev_ch as usize).enumerate() {
                     for (k, &c) in sel.iter().enumerate() {
