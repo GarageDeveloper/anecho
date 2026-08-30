@@ -42,7 +42,7 @@ lint: ## Clippy, warnings are errors
 	cargo clippy --workspace --all-targets -- -D warnings
 
 frontend-check: generate ## Type-check and build the web frontend
-	cd frontend && pnpm install --frozen-lockfile && pnpm exec svelte-check --tsconfig ./tsconfig.json && pnpm exec vite build
+	cd frontend && pnpm install --frozen-lockfile && pnpm exec svelte-check --tsconfig ./tsconfig.json && pnpm run check:mock && pnpm exec vite build
 
 check: fmt-check lint test contract-check frontend-check ## Everything CI runs
 

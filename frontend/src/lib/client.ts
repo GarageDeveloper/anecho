@@ -7,6 +7,7 @@ import {
   EnvelopeSchema,
   GetVersionRequestSchema,
   ListDevicesRequestSchema,
+  MeasureRequestSchema,
   OpenSessionRequestSchema,
   StopStreamRequestSchema,
   type DeviceConfig,
@@ -15,6 +16,8 @@ import {
   type ErrorCode,
   type Event,
   type GetVersionResponse,
+  type MeasureRequest,
+  type MeasureResponse,
   type OpenSessionResponse,
   type StartStreamRequest,
   type StartStreamResponse,
@@ -151,5 +154,11 @@ export class Client {
   async stopStream(streamId: number): Promise<void> {
     const value = create(StopStreamRequestSchema, { streamId });
     await this.expect({ case: "stopStream", value }, "streamStopped");
+  }
+
+  /// One-shot measurement (THD, IMD...). The backend captures, computes and answers.
+  measure(req: MeasureRequest): Promise<MeasureResponse> {
+    const value = create(MeasureRequestSchema, req);
+    return this.expect({ case: "measure", value }, "measurement");
   }
 }
