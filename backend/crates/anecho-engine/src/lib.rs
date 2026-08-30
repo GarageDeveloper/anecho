@@ -232,11 +232,17 @@ impl Engine {
         } else {
             None
         };
-        let block_frames = if req.block_frames == 0 {
+        let mut block_frames = if req.block_frames == 0 {
             4096
         } else {
             req.block_frames
         };
+        // An RTA frame must come from one contiguous capture (the QA40x captures block by
+        // block with a gap in between): ask the device for blocks of at least one FFT.
+        if req.kind == StreamKind::Rta {
+            let fft = req.rta.as_ref().map(|c| c.fft_length as u32).unwrap_or(0);
+            block_frames = block_frames.max(fft);
+        }
         let channels = applied.input_channels.len() as u16;
         if channels == 0 {
             return Err(EngineError::BadRequest(

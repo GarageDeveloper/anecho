@@ -30,8 +30,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-/// Frames generated+captured per driver call.
+/// Default frames generated+captured per driver call (when the stream asks for smaller
+/// blocks). Larger requested blocks raise the chunk so that **one block is always one
+/// contiguous capture**: analyses spanning a whole FFT must never straddle the gap
+/// between two half-duplex calls.
 pub const CHUNK_FRAMES: usize = 8192;
+/// Upper bound of a single call (USB queue depth / memory); 2^18 frames ≈ 5.5 s at 48 kHz.
+pub const MAX_CHUNK_FRAMES: usize = 1 << 18;
 /// Chirp used to measure the round-trip latency at stream start (peak, full scale = 1).
 const LATENCY_PROBE_PEAK: f32 = 0.1;
 /// Capture window of the probe.
@@ -529,9 +534,17 @@ impl Worker {
             return;
         }
 
-        let mut inter = vec![0f32; CHUNK_FRAMES * 2];
-        let mut left = vec![0f32; CHUNK_FRAMES + pad];
-        let mut right = vec![0f32; CHUNK_FRAMES + pad];
+        // One chunk per requested block (rounded up to the default), so a block never
+        // contains a chunk boundary.
+        let block = self.cfg.block_frames.max(1) as usize;
+        let chunk = if block <= CHUNK_FRAMES {
+            CHUNK_FRAMES
+        } else {
+            block.min(MAX_CHUNK_FRAMES)
+        };
+        let mut inter = vec![0f32; chunk * 2];
+        let mut left = vec![0f32; chunk + pad];
+        let mut right = vec![0f32; chunk + pad];
 
         while !self.cancel.load(Ordering::Relaxed) && !self.blocker.is_closed() {
             inter.iter_mut().for_each(|s| *s = 0.0);
@@ -543,8 +556,8 @@ impl Worker {
                 right[i] = if drive_r { fr[1] } else { 0.0 };
             }
             // Trailing zeros: the stimulus tail must have time to come back.
-            left[CHUNK_FRAMES..].iter_mut().for_each(|s| *s = 0.0);
-            right[CHUNK_FRAMES..].iter_mut().for_each(|s| *s = 0.0);
+            left[chunk..].iter_mut().for_each(|s| *s = 0.0);
+            right[chunk..].iter_mut().for_each(|s| *s = 0.0);
             // The device mutex stays held until the chunk's blocks are handed over: a range
             // write waiting on the mutex (`set_input_range`) then always lands *between* the
             // blocks of two chunks, so every block is captured entirely on one range.
