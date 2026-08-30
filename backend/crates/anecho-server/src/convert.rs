@@ -58,6 +58,7 @@ pub fn applied_config(a: &AppliedConfig) -> pb::DeviceConfig {
         output_range: a.output_range.map(|x| x as u32),
         input_channels: a.input_channels.iter().map(|&c| c as u32).collect(),
         output_channels: a.output_channels.iter().map(|&c| c as u32).collect(),
+        auto_range_input: None,
     }
 }
 
@@ -71,6 +72,7 @@ pub fn stream_request(r: &pb::StartStreamRequest) -> Result<StreamRequest, Engin
         None => None,
         Some(pb::Generator {
             signal: Some(pb::generator::Signal::Sine(s)),
+            ..
         }) => Some(Signal::Sine {
             frequency_hz: s.frequency_hz,
             amplitude_dbfs: s.amplitude_dbfs,
@@ -105,6 +107,8 @@ pub fn stream_started(i: &StreamInfo) -> pb::StartStreamResponse {
         sample_rate: i.sample_rate,
         scale: Some(scale(i.scale)),
         values_per_channel: i.values_per_channel as u32,
+        axis_hz: vec![],
+        axis_seconds: vec![],
     }
 }
 

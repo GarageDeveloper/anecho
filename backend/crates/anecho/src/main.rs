@@ -137,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
                             frequency_hz: f.trim().parse()?,
                             amplitude_dbfs: a.trim().parse()?,
                         })),
+                        ..Default::default()
                     })
                 }
             };
@@ -148,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
                     block_frames: 0,
                     levels_rate_hz: rate_hz,
                     generator,
+                    ..Default::default()
                 })
                 .await
                 .context("start stream")?;

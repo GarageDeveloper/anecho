@@ -71,7 +71,9 @@ async fn headless_loopback_levels_and_raw() {
                     frequency_hz: 1000.0,
                     amplitude_dbfs: -20.0,
                 })),
+                ..Default::default()
             }),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -119,7 +121,9 @@ async fn headless_loopback_levels_and_raw() {
                     frequency_hz: 1000.0,
                     amplitude_dbfs: 0.0,
                 })),
+                ..Default::default()
             }),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -275,7 +279,9 @@ async fn headless_qa40x_simulator_levels_in_dbv() {
                     frequency_hz: 1000.0,
                     amplitude_dbfs: -20.0,
                 })),
+                ..Default::default()
             }),
+            ..Default::default()
         })
         .await
         .unwrap();
