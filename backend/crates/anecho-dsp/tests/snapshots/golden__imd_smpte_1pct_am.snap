@@ -1,0 +1,8 @@
+---
+source: backend/crates/anecho-dsp/tests/golden.rs
+expression: "((r.imd_pct * 1e4).round() / 1e4, r3(r.imd_db))"
+---
+[
+  0.7071,
+  -43.01
+]

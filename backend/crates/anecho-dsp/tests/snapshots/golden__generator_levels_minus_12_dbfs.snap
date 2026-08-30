@@ -1,0 +1,41 @@
+---
+source: backend/crates/anecho-dsp/tests/golden.rs
+expression: out
+---
+[
+  {
+    "name": "sine",
+    "peak": 0.251,
+    "rms_db": -15.011
+  },
+  {
+    "name": "square",
+    "peak": 0.251,
+    "rms_db": -12.0
+  },
+  {
+    "name": "dual_smpte",
+    "peak": 0.251,
+    "rms_db": -16.681
+  },
+  {
+    "name": "multitone_10",
+    "peak": 0.251,
+    "rms_db": -17.279
+  },
+  {
+    "name": "white",
+    "peak": 0.308,
+    "rms_db": -15.032
+  },
+  {
+    "name": "pink",
+    "peak": 0.687,
+    "rms_db": -14.643
+  },
+  {
+    "name": "periodic_4096",
+    "peak": 0.308,
+    "rms_db": -15.006
+  }
+]

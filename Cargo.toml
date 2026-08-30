@@ -18,6 +18,7 @@ authors = ["Anecho contributors"]
 [workspace.dependencies]
 anecho-contract = { path = "backend/crates/anecho-contract" }
 anecho-device = { path = "backend/crates/anecho-device" }
+anecho-dsp = { path = "backend/crates/anecho-dsp" }
 anecho-engine = { path = "backend/crates/anecho-engine" }
 anecho-wire = { path = "backend/crates/anecho-wire" }
 anecho-server = { path = "backend/crates/anecho-server" }
@@ -34,6 +35,10 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
+realfft = "3"
+rustfft = "6"
+num-complex = "0.4"
+insta = { version = "1", features = ["json"] }
 futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = "0.30"

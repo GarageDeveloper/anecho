@@ -1,0 +1,5 @@
+---
+source: backend/crates/anecho-dsp/tests/golden.rs
+expression: r3(10.0 * total.log10())
+---
+-14.44
