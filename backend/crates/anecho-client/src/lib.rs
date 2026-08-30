@@ -184,6 +184,14 @@ impl Client {
         }
     }
 
+    /// One-shot measurement (THD, IMD...). Blocks until the result is in.
+    pub async fn measure(&self, req: pb::MeasureRequest) -> Result<pb::MeasureResponse> {
+        match self.request(Payload::Measure(req)).await? {
+            Payload::Measurement(m) => Ok(m),
+            p => Err(ClientError::Unexpected(format!("{p:?}"))),
+        }
+    }
+
     pub async fn stop_stream(&self, stream_id: u32) -> Result<()> {
         match self
             .request(Payload::StopStream(pb::StopStreamRequest { stream_id }))

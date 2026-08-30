@@ -127,6 +127,30 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         seconds: f64,
     },
+    /// One-shot distortion measurement: thd, imd-smpte or imd-ccif.
+    Measure {
+        #[arg(long, default_value = "ws://127.0.0.1:4800/ws")]
+        url: String,
+        #[arg(long)]
+        device: String,
+        #[arg(long, default_value_t = 48_000)]
+        sample_rate: u32,
+        /// thd, imd-smpte, imd-ccif.
+        #[arg(long, default_value = "thd")]
+        kind: String,
+        /// Generator signal; defaults to the kind's standard stimulus.
+        #[arg(long)]
+        signal: Option<String>,
+        #[arg(long, default_value = "-20dBFS")]
+        level: String,
+        #[arg(long, default_value_t = 65_536)]
+        fft: u32,
+        #[arg(long, default_value_t = 4)]
+        averages: u32,
+        /// Input range index (see `devices`); default: the device's safe default.
+        #[arg(long)]
+        input_range: Option<u32>,
+    },
 }
 
 mod cli;
@@ -399,6 +423,80 @@ async fn main() -> anyhow::Result<()> {
                     .map(|c| format!("{:9.4}", f.channel(c)[i]))
                     .collect();
                 println!("{:9.3}  {}", t * 1000.0, cols.join(" "));
+            }
+        }
+        Cmd::Measure {
+            url,
+            device,
+            sample_rate,
+            kind,
+            signal,
+            level,
+            fft,
+            averages,
+            input_range,
+        } => {
+            let (kind, default_signal) = match kind.as_str() {
+                "thd" => (pb::MeasureKind::Thd, "sine:1000"),
+                "imd-smpte" => (pb::MeasureKind::ImdSmpte, "dual:60,7000,12.04"),
+                "imd-ccif" => (pb::MeasureKind::ImdCcif, "dual:19000,20000,0"),
+                other => anyhow::bail!("unknown kind {other:?} (thd, imd-smpte, imd-ccif)"),
+            };
+            let generator = cli::generator(
+                Some(signal.as_deref().unwrap_or(default_signal)),
+                Some(&level),
+                None,
+            )?;
+            let client = Client::connect(&url).await?;
+            let session = client
+                .open_session(
+                    &device,
+                    pb::DeviceConfig {
+                        sample_rate,
+                        input_range,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .context("open session")?;
+            let m = client
+                .measure(pb::MeasureRequest {
+                    session_id: session.session_id,
+                    kind: kind as i32,
+                    generator,
+                    fft_length: fft,
+                    averages,
+                    ..Default::default()
+                })
+                .await
+                .context("measure")?;
+            client.close_session(session.session_id).await?;
+            let unit = unit_of(m.scale.as_ref());
+            println!(
+                "{} at {} Hz, FFT {fft}, {averages} averages",
+                kind.as_str_name(),
+                m.sample_rate
+            );
+            for (c, r) in m.per_channel.iter().enumerate() {
+                println!(
+                    "ch{c}: fundamental {:.2} Hz at {:.2} {unit} (RMS)",
+                    r.fundamental_hz, r.fundamental_level
+                );
+                match kind {
+                    pb::MeasureKind::Thd => {
+                        println!(
+                            "     THD {:.5} % ({:.2} dB)   THD+N {:.5} % ({:.2} dB)   noise floor {:.1} dB/bin",
+                            r.thd_pct, r.thd_db, r.thd_n_pct, r.thd_n_db, r.noise_floor_db
+                        );
+                        for h in &r.harmonics {
+                            println!(
+                                "     H{:<2} {:9.1} Hz  {:7.2} dBc",
+                                h.order, h.frequency_hz, h.level_db_rel
+                            );
+                        }
+                    }
+                    _ => println!("     IMD {:.5} % ({:.2} dB)", r.imd_pct, r.imd_db),
+                }
             }
         }
     }

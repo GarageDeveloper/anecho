@@ -138,6 +138,7 @@ mod tests {
             frames: 2048,
             samples: Arc::from(samples),
             dropped_before: 0,
+            scale: anecho_device::Scale::Dbfs,
         };
         let cfg = ScopeConfig {
             window_frames: 480,

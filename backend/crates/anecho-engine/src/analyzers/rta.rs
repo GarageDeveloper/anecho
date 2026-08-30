@@ -230,6 +230,7 @@ mod tests {
             frames: frames as u32,
             samples: Arc::from(samples),
             dropped_before: 0,
+            scale: anecho_device::Scale::Dbfs,
         }
     }
 

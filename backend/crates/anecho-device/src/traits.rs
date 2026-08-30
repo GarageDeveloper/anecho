@@ -1,5 +1,5 @@
-use crate::Result;
 use crate::types::*;
+use crate::{DeviceError, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
@@ -56,6 +56,14 @@ pub trait MeasurementDevice: Send + Sync {
     fn scale(&self, direction: Direction) -> Scale;
 
     fn latency(&self) -> LatencyInfo;
+
+    /// Switch the input range **while streaming** (between capture blocks). Backends with
+    /// ranges implement it; `scale(Direction::Input)` reflects the new range afterwards.
+    async fn set_input_range(&self, _index: usize) -> Result<()> {
+        Err(DeviceError::UnsupportedConfig(
+            "this device has no switchable input range".into(),
+        ))
+    }
 }
 
 /// A source of devices: enumerates and opens them.

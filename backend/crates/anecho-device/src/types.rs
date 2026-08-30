@@ -172,6 +172,9 @@ pub struct InputBlock {
     pub samples: Arc<[f32]>,
     /// Number of blocks the backend had to drop before this one (0 = none).
     pub dropped_before: u32,
+    /// Input scale the block was captured with. Carried per block so that a range change
+    /// applied between two blocks never mislabels data already captured.
+    pub scale: Scale,
 }
 
 /// Opaque handle to a running stream.

@@ -2,11 +2,14 @@
 //! data ([`Frame`]s) so that no client ever computes anything.
 
 pub mod analyzers;
+pub mod autorange;
 pub mod generator;
 pub mod levels;
+pub mod measure;
 
 pub use analyzers::rta::{RtaAxis, RtaConfig};
 pub use analyzers::scope::{ScopeConfig, Trigger};
+pub use measure::{ChannelDistortion, MeasureKind, MeasureRequest, MeasureResult};
 
 use anecho_device::{
     DeviceConfig, DeviceDescriptor, DeviceError, DeviceId, DeviceRegistry, Direction, InputBlock,
@@ -112,6 +115,10 @@ pub enum Event {
 struct Session {
     device: Arc<dyn MeasurementDevice>,
     stream: Option<RunningStream>,
+    /// A one-shot measurement is using the device.
+    measuring: bool,
+    /// Input auto-range requested at open.
+    auto_range: bool,
 }
 
 struct RunningStream {
@@ -170,6 +177,7 @@ impl Engine {
         config: DeviceConfig,
     ) -> Result<(u64, anecho_device::AppliedConfig)> {
         let device = self.registry.open(device_id).await?;
+        let auto_range = config.auto_range_input;
         let applied = device.configure(config).await?;
         let id = {
             let mut n = self.next_session.lock().await;
@@ -182,6 +190,8 @@ impl Engine {
             Session {
                 device: Arc::from(device),
                 stream: None,
+                measuring: false,
+                auto_range,
             },
         );
         Ok((id, applied))
@@ -205,7 +215,7 @@ impl Engine {
         let session = sessions
             .get_mut(&session_id)
             .ok_or(EngineError::NoSuchSession(session_id))?;
-        if session.stream.is_some() {
+        if session.stream.is_some() || session.measuring {
             return Err(EngineError::StreamRunning(session_id));
         }
         let applied = session
@@ -213,6 +223,15 @@ impl Engine {
             .applied_config()
             .await
             .ok_or(DeviceError::NotConfigured)?;
+        let auto_range = if session.auto_range {
+            autorange::AutoRange::new(
+                session.device.clone(),
+                applied.input_range.unwrap_or(0),
+                applied.sample_rate,
+            )
+        } else {
+            None
+        };
         let block_frames = if req.block_frames == 0 {
             4096
         } else {
@@ -318,6 +337,7 @@ impl Engine {
             processor,
             self.frames.clone(),
             self.events.clone(),
+            auto_range.map(|a| (a, session_id, session.device.clone())),
         ));
         session.stream = Some(RunningStream {
             info: info.clone(),
@@ -473,12 +493,15 @@ fn emit(
     *seq += 1;
 }
 
+type AutoRangeCtx = (autorange::AutoRange, u64, Arc<dyn MeasurementDevice>);
+
 async fn pump(
     mut rx: mpsc::Receiver<InputBlock>,
     stream_id: u32,
     mut processor: Processor,
     frames: broadcast::Sender<Arc<Frame>>,
     events: broadcast::Sender<Event>,
+    mut auto_range: Option<AutoRangeCtx>,
 ) {
     let mut seq: u64 = 0;
     while let Some(block) = rx.recv().await {
@@ -486,6 +509,26 @@ async fn pump(
             let _ = events.send(Event::StreamOverrun {
                 stream_id,
                 dropped_blocks: block.dropped_before,
+            });
+        }
+        // Every block carries the scale it was captured with (a range may change between
+        // two blocks while earlier blocks are still queued): label with the block's own.
+        let block_offset = match block.scale {
+            Scale::Dbfs => 0.0,
+            Scale::Volts { dbv_offset } => dbv_offset,
+        };
+        match &mut processor {
+            Processor::Levels(m) => m.set_offset_db(block_offset),
+            Processor::Rta(r) => r.set_offset_db(block_offset),
+            Processor::Raw | Processor::Scope(_) => {}
+        }
+        if let Some((ar, session_id, _device)) = auto_range.as_mut()
+            && let Some(new_range) = ar.observe(&block).await
+        {
+            let _ = events.send(Event::RangeChanged {
+                session_id: *session_id,
+                input_range: Some(new_range),
+                output_range: None,
             });
         }
         match &mut processor {

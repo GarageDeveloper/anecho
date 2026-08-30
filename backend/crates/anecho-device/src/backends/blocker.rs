@@ -4,7 +4,7 @@
 //! `block_frames`. Designed for audio callbacks: no allocation after construction except
 //! the `Arc<[f32]>` of each emitted block, and never blocks (`try_send`).
 
-use crate::InputBlock;
+use crate::{InputBlock, Scale};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -18,6 +18,7 @@ pub struct Blocker {
     dropped: u32,
     tx: mpsc::Sender<InputBlock>,
     blocking: bool,
+    scale: Scale,
 }
 
 impl Blocker {
@@ -32,7 +33,14 @@ impl Blocker {
             dropped: 0,
             tx,
             blocking: false,
+            scale: Scale::Dbfs,
         }
+    }
+
+    /// Scale stamped on the blocks emitted from now on (call before pushing the samples
+    /// captured under that scale).
+    pub fn set_scale(&mut self, scale: Scale) {
+        self.scale = scale;
     }
 
     /// Wait for channel room instead of dropping (only for threads that are allowed to
@@ -66,6 +74,7 @@ impl Blocker {
             frames: self.block_frames as u32,
             samples,
             dropped_before: self.dropped,
+            scale: self.scale,
         };
         self.seq += 1;
         self.first_frame += self.block_frames as u64;

@@ -52,6 +52,11 @@ impl LevelMeter {
         self
     }
 
+    /// Refresh the offset (input range changed).
+    pub fn set_offset_db(&mut self, offset_db: f32) {
+        self.offset_db = offset_db;
+    }
+
     pub fn window_frames(&self) -> usize {
         self.window_frames
     }
@@ -115,6 +120,7 @@ mod tests {
             frames: 9600,
             samples: Arc::from(samples),
             dropped_before: 0,
+            scale: anecho_device::Scale::Dbfs,
         };
         let readings = m.push(&block);
         assert_eq!(readings.len(), 2);

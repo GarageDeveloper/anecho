@@ -183,7 +183,7 @@ impl DeviceBackend for Qa40xBackend {
             descriptor: Self::describe(&enriched),
             handle,
             state: Mutex::new(State::default()),
-            offsets_dbv: std::sync::Mutex::new((0.0, 0.0)),
+            offsets_dbv: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
             measured_latency: Arc::new(std::sync::Mutex::new(None)),
         }))
     }
@@ -206,8 +206,9 @@ pub struct Qa40xDevice {
     descriptor: DeviceDescriptor,
     handle: DeviceHandle,
     state: Mutex<State>,
-    /// (input, output) dBV offsets for the applied ranges; cached because `scale` is sync.
-    offsets_dbv: std::sync::Mutex<(f32, f32)>,
+    /// (input, output) dBV offsets for the applied ranges; cached because `scale` is sync,
+    /// shared with the stream worker which stamps every block with the input offset.
+    offsets_dbv: Arc<std::sync::Mutex<(f32, f32)>>,
     /// Round-trip latency measured at the last generating stream start, in frames.
     measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
 }
@@ -322,7 +323,7 @@ impl MeasurementDevice for Qa40xDevice {
             source: output,
             cancel: cancel.clone(),
             measured_latency: self.measured_latency.clone(),
-            offsets_dbv: *self.offsets_dbv.lock().unwrap(),
+            offsets_dbv: self.offsets_dbv.clone(),
         };
         let task = tokio::spawn(worker.run());
         st.running = Some(Running {
@@ -365,6 +366,26 @@ impl MeasurementDevice for Qa40xDevice {
             measured_frames: self.measured_latency.lock().unwrap().map(|l| l as f64),
         }
     }
+
+    /// Range write between two capture chunks: the worker only holds the device mutex
+    /// during `generate_and_capture`, so this waits for the current chunk, writes the range
+    /// (the driver handles the attenuator-out quirk) and refreshes the cached dBV offset.
+    async fn set_input_range(&self, index: usize) -> Result<()> {
+        let caps = &self.descriptor.capabilities;
+        let dbv = Self::range_dbv(&caps.input_ranges, Some(index), 0)?;
+        let gain = InputGain::from_dbv(dbv)
+            .ok_or_else(|| DeviceError::UnsupportedConfig(format!("input range {dbv} dBV")))?;
+        let dev = self.handle.lock().await;
+        dev.set_input_gain(gain).await.map_err(map_qerr)?;
+        let (in_off, _) = dev.input_dbv_offset(Channel::Left).await;
+        drop(dev);
+        self.offsets_dbv.lock().unwrap().0 = in_off;
+        let mut st = self.state.lock().await;
+        if let Some(a) = st.applied.as_mut() {
+            a.input_range = Some(index);
+        }
+        Ok(())
+    }
 }
 
 struct Worker {
@@ -375,7 +396,7 @@ struct Worker {
     blocker: Blocker,
     cancel: Arc<AtomicBool>,
     measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
-    offsets_dbv: (f32, f32),
+    offsets_dbv: Arc<std::sync::Mutex<(f32, f32)>>,
 }
 
 /// Linear chirp, `LATENCY_CHIRP_FRAMES` long, zero-padded to `LATENCY_PROBE_FRAMES`.
@@ -477,6 +498,7 @@ impl Worker {
         let cap_r = self.applied.input_channels.contains(&1);
 
         // Latency compensation only matters when we drive the outputs.
+        let offsets = *self.offsets_dbv.lock().unwrap();
         let pad = if self.cfg.generate && (drive_l || drive_r) {
             match probe_latency(
                 &self.handle,
@@ -484,7 +506,7 @@ impl Worker {
                 self.applied.sample_rate,
                 drive_l,
                 drive_r,
-                self.offsets_dbv,
+                offsets,
             )
             .await
             {
@@ -523,11 +545,13 @@ impl Worker {
             // Trailing zeros: the stimulus tail must have time to come back.
             left[CHUNK_FRAMES..].iter_mut().for_each(|s| *s = 0.0);
             right[CHUNK_FRAMES..].iter_mut().for_each(|s| *s = 0.0);
+            // The device mutex stays held until the chunk's blocks are handed over: a range
+            // write waiting on the mutex (`set_input_range`) then always lands *between* the
+            // blocks of two chunks, so every block is captured entirely on one range.
             let dev = self.handle.lock().await;
             let res = dev
                 .generate_and_capture_cancellable(&left, &right, Some(&self.cancel))
                 .await;
-            drop(dev);
             let audio = match res {
                 Ok(a) => a,
                 Err(e) => {
@@ -547,7 +571,11 @@ impl Worker {
                 out.push(if cap_l { audio.left_channel[i] } else { 0.0 });
                 out.push(if cap_r { audio.right_channel[i] } else { 0.0 });
             }
+            // Stamp the blocks with the input offset the chunk was captured under.
+            let in_off = self.offsets_dbv.lock().unwrap().0;
+            self.blocker.set_scale(Scale::Volts { dbv_offset: in_off });
             self.blocker.push(&out);
+            drop(dev);
         }
     }
 }

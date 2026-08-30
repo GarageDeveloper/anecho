@@ -175,6 +175,13 @@ async fn handle(
             my_streams.remove(&req.stream_id);
             Payload::StreamStopped(pb::StopStreamResponse {})
         }),
+        Payload::Measure(req) => match convert::measure_request(&req) {
+            Ok(mr) => engine
+                .measure(req.session_id, mr)
+                .await
+                .map(|r| Payload::Measurement(convert::measure_response(&r))),
+            Err(e) => Err(e),
+        },
         other => Err(EngineError::BadRequest(format!("not a request: {other:?}"))),
     };
     match result {

@@ -49,6 +49,11 @@ impl Averager {
         self.count
     }
 
+    /// The current average (empty before the first block).
+    pub fn current(&self) -> &[f64] {
+        &self.acc
+    }
+
     /// Feed one power spectrum; returns the current average.
     pub fn push(&mut self, power: &[f64]) -> &[f64] {
         if self.acc.len() != power.len() {

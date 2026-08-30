@@ -7,8 +7,8 @@ use anecho_device::{
 use anecho_dsp::{Averaging, Window};
 use anecho_engine::generator::{GenLevel, GeneratorSpec, Signal};
 use anecho_engine::{
-    EngineError, Event, RtaAxis, RtaConfig, ScopeConfig, StreamInfo, StreamKind, StreamRequest,
-    Trigger,
+    EngineError, Event, MeasureKind, MeasureRequest, MeasureResult, RtaAxis, RtaConfig,
+    ScopeConfig, StreamInfo, StreamKind, StreamRequest, Trigger,
 };
 
 pub fn backend_kind(k: BackendKind) -> pb::BackendKind {
@@ -153,6 +153,73 @@ pub fn rta_config(c: &pb::RtaConfig) -> Result<RtaConfig, EngineError> {
         axis,
         update_rate_hz: c.update_rate_hz,
     })
+}
+
+pub fn measure_request(r: &pb::MeasureRequest) -> Result<MeasureRequest, EngineError> {
+    let kind = match pb::MeasureKind::try_from(r.kind) {
+        Ok(pb::MeasureKind::Thd) => MeasureKind::Thd,
+        Ok(pb::MeasureKind::ImdSmpte) => MeasureKind::ImdSmpte,
+        Ok(pb::MeasureKind::ImdCcif) => MeasureKind::ImdCcif,
+        _ => return Err(EngineError::BadRequest("measure kind is required".into())),
+    };
+    let window = match pb::rta_config::Window::try_from(r.window) {
+        Ok(pb::rta_config::Window::Unspecified) => Window::BlackmanHarris7,
+        _ => window(r.window)?,
+    };
+    let band_hz = match (r.band_min_hz > 0.0, r.band_max_hz > 0.0) {
+        (false, false) => None,
+        (lo, hi) => Some((
+            if lo { r.band_min_hz as f64 } else { 20.0 },
+            if hi { r.band_max_hz as f64 } else { 20_000.0 },
+        )),
+    };
+    Ok(MeasureRequest {
+        kind,
+        generator: r.generator.as_ref().map(generator).transpose()?,
+        fft_length: r.fft_length as usize,
+        window,
+        averages: r.averages,
+        max_harmonic: r.max_harmonic,
+        band_hz,
+    })
+}
+
+pub fn measure_response(r: &MeasureResult) -> pb::MeasureResponse {
+    let kind = match r.kind {
+        MeasureKind::Thd => pb::MeasureKind::Thd,
+        MeasureKind::ImdSmpte => pb::MeasureKind::ImdSmpte,
+        MeasureKind::ImdCcif => pb::MeasureKind::ImdCcif,
+    };
+    pb::MeasureResponse {
+        kind: kind as i32,
+        channel: 0,
+        per_channel: r
+            .per_channel
+            .iter()
+            .map(|c| pb::DistortionResult {
+                fundamental_hz: c.fundamental_hz as f32,
+                fundamental_level: c.fundamental_level as f32,
+                thd_pct: c.thd_pct as f32,
+                thd_db: c.thd_db as f32,
+                thd_n_pct: c.thd_n_pct as f32,
+                thd_n_db: c.thd_n_db as f32,
+                harmonics: c
+                    .harmonics
+                    .iter()
+                    .map(|h| pb::distortion_result::Harmonic {
+                        order: h.n,
+                        frequency_hz: h.hz as f32,
+                        level_db_rel: h.level_db_rel as f32,
+                    })
+                    .collect(),
+                noise_floor_db: c.noise_floor_db as f32,
+                imd_pct: c.imd_pct as f32,
+                imd_db: c.imd_db as f32,
+            })
+            .collect(),
+        sample_rate: r.sample_rate,
+        scale: Some(scale(r.scale)),
+    }
 }
 
 pub fn scope_config(c: &pb::ScopeConfig) -> ScopeConfig {
