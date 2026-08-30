@@ -9,7 +9,11 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["cpal"]
+default = ["cpal", "qa40x"]
+# QuantAsylum QA402/QA403 through qa40x-driver (native USB, factory calibration).
+qa40x = ["dep:qa40x-driver"]
+# Also expose the embedded QA40x simulator (hardware-free tests and demos).
+qa40x-sim = ["qa40x", "qa40x-driver/sim"]
 # Generic sound cards through cpal (WASAPI shared mode, Core Audio, ALSA).
 cpal = ["dep:cpal"]
 # Steinberg ASIO on Windows. Needs the ASIO SDK (GPLv3+ since Oct 2025) and LLVM at build
@@ -23,9 +27,11 @@ thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 cpal = { version = "0.18", optional = true }
+qa40x-driver = { path = "../../../drivers/qa40x-driver", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+env_logger = "0.11"
 
 [lints]
 workspace = true
