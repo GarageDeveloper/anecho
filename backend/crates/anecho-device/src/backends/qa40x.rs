@@ -183,7 +183,17 @@ impl DeviceBackend for Qa40xBackend {
             .find(|s| s.id().as_str() == did.source())
             .ok_or_else(|| DeviceError::NotFound(id.to_string()))?;
         let handle: DeviceHandle = Arc::new(Mutex::new(QA40xDevice::new()));
-        let enriched = source.open(&did, &handle).await.map_err(map_err)?;
+        // The interface is claimed exclusively; a handle that was just dropped (previous
+        // session) may still be releasing it, so retry once after a short pause.
+        let enriched = match source.open(&did, &handle).await {
+            Ok(d) => d,
+            Err(e) if e.to_string().to_ascii_lowercase().contains("claim") => {
+                log::warn!("{id}: {e}; retrying in 500 ms");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                source.open(&did, &handle).await.map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
         Ok(Box::new(Qa40xDevice {
             descriptor: Self::describe(&enriched),
             handle,

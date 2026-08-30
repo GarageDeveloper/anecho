@@ -309,3 +309,61 @@ async fn headless_qa40x_simulator_levels_in_dbv() {
     client.stop_stream(stream.stream_id).await.unwrap();
     client.close_session(session.session_id).await.unwrap();
 }
+
+/// A USB analyzer is claimed exclusively: a second session on the same device must reuse
+/// the open handle (no second claim), and it is refused only while the first one streams.
+#[cfg(feature = "qa40x-sim")]
+#[tokio::test]
+async fn two_sessions_share_one_open_qa40x() {
+    use anecho_device::backends::qa40x::Qa40xBackend;
+    let registry =
+        DeviceRegistry::new().with_backend(Arc::new(Qa40xBackend::empty().with_simulator(false)));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, _task) = anecho_server::serve(
+        Engine::new(registry),
+        "127.0.0.1:0".parse().unwrap(),
+        async {
+            let _ = stop_rx.await;
+        },
+    )
+    .await
+    .unwrap();
+    let _stop = stop_tx;
+    let a = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+    let b = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+    let dev = a.list_devices().await.unwrap().remove(0);
+    let cfg = pb::DeviceConfig {
+        sample_rate: 48_000,
+        ..Default::default()
+    };
+    let s1 = a.open_session(&dev.id, cfg.clone()).await.unwrap();
+    let s2 = b
+        .open_session(&dev.id, cfg.clone())
+        .await
+        .expect("second session reuses the open device");
+    assert_ne!(s1.session_id, s2.session_id);
+
+    let stream = a
+        .start_stream(pb::StartStreamRequest {
+            session_id: s1.session_id,
+            kind: pb::StreamKind::Levels as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // While A streams, B cannot reconfigure the shared device...
+    let err = b.open_session(&dev.id, cfg.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            anecho_client::ClientError::Server {
+                code: pb::ErrorCode::Busy,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    a.stop_stream(stream.stream_id).await.unwrap();
+    // ...and can again once it stopped.
+    b.open_session(&dev.id, cfg).await.unwrap();
+}

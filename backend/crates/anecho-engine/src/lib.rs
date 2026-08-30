@@ -130,6 +130,10 @@ struct RunningStream {
 pub struct Engine {
     registry: DeviceRegistry,
     sessions: Mutex<HashMap<u64, Session>>,
+    /// Devices currently open, shared between sessions: a USB analyzer is claimed
+    /// exclusively, so a second session on the same device must reuse the open handle
+    /// instead of opening it again. Entries die with their last session.
+    open_devices: Mutex<HashMap<DeviceId, std::sync::Weak<dyn MeasurementDevice>>>,
     next_session: Mutex<u64>,
     next_stream: Mutex<u32>,
     frames: broadcast::Sender<Arc<Frame>>,
@@ -151,6 +155,7 @@ impl Engine {
         Arc::new(Self {
             registry,
             sessions: Mutex::new(HashMap::new()),
+            open_devices: Mutex::new(HashMap::new()),
             next_session: Mutex::new(1),
             next_stream: Mutex::new(1),
             frames,
@@ -176,7 +181,19 @@ impl Engine {
         device_id: &DeviceId,
         config: DeviceConfig,
     ) -> Result<(u64, anecho_device::AppliedConfig)> {
-        let device = self.registry.open(device_id).await?;
+        let device: Arc<dyn MeasurementDevice> = {
+            let mut open = self.open_devices.lock().await;
+            open.retain(|_, w| w.strong_count() > 0);
+            match open.get(device_id).and_then(|w| w.upgrade()) {
+                Some(shared) => shared,
+                None => {
+                    let d: Arc<dyn MeasurementDevice> =
+                        Arc::from(self.registry.open(device_id).await?);
+                    open.insert(device_id.clone(), Arc::downgrade(&d));
+                    d
+                }
+            }
+        };
         let auto_range = config.auto_range_input;
         let applied = device.configure(config).await?;
         let id = {
@@ -188,7 +205,7 @@ impl Engine {
         self.sessions.lock().await.insert(
             id,
             Session {
-                device: Arc::from(device),
+                device,
                 stream: None,
                 measuring: false,
                 auto_range,
