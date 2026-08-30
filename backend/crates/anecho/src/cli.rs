@@ -134,6 +134,51 @@ pub fn generator(
     }))
 }
 
+/// `--window` names.
+pub fn parse_window(s: &str) -> anyhow::Result<pb::rta_config::Window> {
+    use pb::rta_config::Window as W;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "rect" | "rectangular" => W::Rectangular,
+        "hann" => W::Hann,
+        "bh4" | "blackman-harris-4" => W::BlackmanHarris4,
+        "bh7" | "blackman-harris-7" => W::BlackmanHarris7,
+        "flattop" | "flat-top" => W::FlatTop,
+        other => bail!("unknown window {other:?} (rect, hann, bh4, bh7, flattop)"),
+    })
+}
+
+/// `--averaging` syntax: `none`, `exp[:n]`, `linear[:n]`, `peak`.
+pub fn parse_averaging(s: &str) -> anyhow::Result<pb::rta_config::Averaging> {
+    use pb::rta_config::averaging::Mode;
+    let (kind, n) = match s.split_once(':') {
+        Some((k, n)) => (k, n.parse::<u32>().context("averaging count")?),
+        None => (s, 0),
+    };
+    let mode = match kind.to_ascii_lowercase().as_str() {
+        "none" => Mode::Unspecified,
+        "exp" | "exponential" => Mode::Exponential,
+        "linear" | "lin" => Mode::Linear,
+        "peak" | "peak-hold" => Mode::PeakHold,
+        other => bail!("unknown averaging {other:?} (none, exp[:n], linear[:n], peak)"),
+    };
+    Ok(pb::rta_config::Averaging {
+        mode: mode as i32,
+        count: n,
+    })
+}
+
+/// Frequency of the generator's main tone, if any (for the RTA readout).
+pub fn generator_hz(g: Option<&pb::Generator>) -> Option<f32> {
+    use pb::generator::Signal as S;
+    match g?.signal.as_ref()? {
+        S::Sine(s) => Some(s.frequency_hz),
+        S::Square(s) => Some(s.frequency_hz),
+        S::DualTone(d) => Some(d.f2_hz),
+        S::Multitone(m) => m.frequencies_hz.first().copied(),
+        S::Noise(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -159,6 +159,7 @@ version = "0.1.0"
 dependencies = [
  "anecho-contract",
  "anecho-device",
+ "anecho-dsp",
  "anecho-engine",
  "anecho-wire",
  "axum",

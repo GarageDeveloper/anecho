@@ -4,8 +4,12 @@ use anecho_contract::v0 as pb;
 use anecho_device::{
     AppliedConfig, BackendKind, Calibration, DeviceConfig, DeviceDescriptor, DeviceError, Scale,
 };
+use anecho_dsp::{Averaging, Window};
 use anecho_engine::generator::{GenLevel, GeneratorSpec, Signal};
-use anecho_engine::{EngineError, Event, StreamInfo, StreamKind, StreamRequest};
+use anecho_engine::{
+    EngineError, Event, RtaAxis, RtaConfig, ScopeConfig, StreamInfo, StreamKind, StreamRequest,
+    Trigger,
+};
 
 pub fn backend_kind(k: BackendKind) -> pb::BackendKind {
     match k {
@@ -68,6 +72,8 @@ pub fn stream_request(r: &pb::StartStreamRequest) -> Result<StreamRequest, Engin
     let kind = match pb::StreamKind::try_from(r.kind) {
         Ok(pb::StreamKind::Levels) => StreamKind::Levels,
         Ok(pb::StreamKind::RawInput) => StreamKind::RawInput,
+        Ok(pb::StreamKind::Rta) => StreamKind::Rta,
+        Ok(pb::StreamKind::Scope) => StreamKind::Scope,
         _ => return Err(EngineError::BadRequest("stream kind is required".into())),
     };
     let generator = r.generator.as_ref().map(generator).transpose()?;
@@ -76,7 +82,106 @@ pub fn stream_request(r: &pb::StartStreamRequest) -> Result<StreamRequest, Engin
         block_frames: r.block_frames,
         levels_rate_hz: r.levels_rate_hz,
         generator,
+        rta: r.rta.as_ref().map(rta_config).transpose()?,
+        scope: r.scope.as_ref().map(scope_config),
     })
+}
+
+pub fn window(w: i32) -> Result<Window, EngineError> {
+    use pb::rta_config::Window as W;
+    Ok(match W::try_from(w) {
+        Ok(W::Unspecified) | Ok(W::Hann) => Window::Hann,
+        Ok(W::Rectangular) => Window::Rectangular,
+        Ok(W::BlackmanHarris4) => Window::BlackmanHarris4,
+        Ok(W::BlackmanHarris7) => Window::BlackmanHarris7,
+        Ok(W::FlatTop) => Window::FlatTop,
+        Err(_) => return Err(EngineError::BadRequest("unknown window".into())),
+    })
+}
+
+pub fn rta_config(c: &pb::RtaConfig) -> Result<RtaConfig, EngineError> {
+    use pb::rta_config::averaging::Mode;
+    let defaults = RtaConfig::default();
+    let averaging = match &c.averaging {
+        None => Averaging::None,
+        Some(a) => {
+            let n = if a.count == 0 { 8 } else { a.count };
+            match Mode::try_from(a.mode) {
+                Ok(Mode::Unspecified) => Averaging::None,
+                Ok(Mode::Exponential) => Averaging::Exponential { n },
+                Ok(Mode::Linear) => Averaging::Linear { n },
+                Ok(Mode::PeakHold) => Averaging::PeakHold,
+                Err(_) => return Err(EngineError::BadRequest("unknown averaging mode".into())),
+            }
+        }
+    };
+    let min_hz = if c.min_hz > 0.0 {
+        c.min_hz as f64
+    } else {
+        20.0
+    };
+    let max_hz = if c.max_hz > 0.0 {
+        c.max_hz as f64
+    } else {
+        20_000.0
+    };
+    let axis = if c.octave_fraction > 0 {
+        RtaAxis::Octave {
+            fraction: c.octave_fraction,
+            min_hz,
+            max_hz,
+        }
+    } else {
+        RtaAxis::Log {
+            min_hz,
+            max_hz,
+            points: if c.points == 0 {
+                1000
+            } else {
+                c.points as usize
+            },
+        }
+    };
+    Ok(RtaConfig {
+        fft_length: if c.fft_length == 0 {
+            defaults.fft_length
+        } else {
+            c.fft_length as usize
+        },
+        window: window(c.window)?,
+        averaging,
+        axis,
+        update_rate_hz: c.update_rate_hz,
+    })
+}
+
+pub fn scope_config(c: &pb::ScopeConfig) -> ScopeConfig {
+    use pb::scope_config::trigger::Mode;
+    let trigger = c
+        .trigger
+        .as_ref()
+        .and_then(|t| match Mode::try_from(t.mode) {
+            Ok(Mode::Rising) => Some(Trigger {
+                rising: true,
+                level: t.level,
+                channel: t.channel as u16,
+            }),
+            Ok(Mode::Falling) => Some(Trigger {
+                rising: false,
+                level: t.level,
+                channel: t.channel as u16,
+            }),
+            _ => None,
+        });
+    ScopeConfig {
+        window_frames: if c.window_frames == 0 {
+            4096
+        } else {
+            c.window_frames as usize
+        },
+        points: c.points as usize,
+        trigger,
+    }
 }
 
 /// Contract generator → engine spec. `Sine.amplitude_dbfs` keeps its v0.1 meaning when no
@@ -200,13 +305,15 @@ pub fn stream_started(i: &StreamInfo) -> pb::StartStreamResponse {
         kind: match i.kind {
             StreamKind::Levels => pb::StreamKind::Levels,
             StreamKind::RawInput => pb::StreamKind::RawInput,
+            StreamKind::Rta => pb::StreamKind::Rta,
+            StreamKind::Scope => pb::StreamKind::Scope,
         } as i32,
         channels: i.channels as u32,
         sample_rate: i.sample_rate,
         scale: Some(scale(i.scale)),
         values_per_channel: i.values_per_channel as u32,
-        axis_hz: vec![],
-        axis_seconds: vec![],
+        axis_hz: i.axis_hz.clone(),
+        axis_seconds: i.axis_seconds.clone(),
     }
 }
 

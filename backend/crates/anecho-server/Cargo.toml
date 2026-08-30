@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 anecho-contract.workspace = true
 anecho-device.workspace = true
+anecho-dsp.workspace = true
 anecho-engine.workspace = true
 anecho-wire.workspace = true
 axum.workspace = true

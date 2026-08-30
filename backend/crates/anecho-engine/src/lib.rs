@@ -1,8 +1,12 @@
 //! The headless Anecho engine. Owns devices, sessions and streams; produces ready-to-plot
 //! data ([`Frame`]s) so that no client ever computes anything.
 
+pub mod analyzers;
 pub mod generator;
 pub mod levels;
+
+pub use analyzers::rta::{RtaAxis, RtaConfig};
+pub use analyzers::scope::{ScopeConfig, Trigger};
 
 use anecho_device::{
     DeviceConfig, DeviceDescriptor, DeviceError, DeviceId, DeviceRegistry, Direction, InputBlock,
@@ -38,6 +42,8 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub enum StreamKind {
     Levels,
     RawInput,
+    Rta,
+    Scope,
 }
 
 /// Parameters of a stream start.
@@ -49,6 +55,23 @@ pub struct StreamRequest {
     /// LEVELS only; 0 = default (20 Hz).
     pub levels_rate_hz: f32,
     pub generator: Option<generator::GeneratorSpec>,
+    /// RTA only; `None` = defaults.
+    pub rta: Option<RtaConfig>,
+    /// SCOPE only; `None` = defaults.
+    pub scope: Option<ScopeConfig>,
+}
+
+impl StreamRequest {
+    pub fn new(kind: StreamKind) -> Self {
+        Self {
+            kind,
+            block_frames: 0,
+            levels_rate_hz: 0.0,
+            generator: None,
+            rta: None,
+            scope: None,
+        }
+    }
 }
 
 /// What a started stream looks like on the wire.
@@ -61,6 +84,10 @@ pub struct StreamInfo {
     pub sample_rate: u32,
     pub scale: Scale,
     pub values_per_channel: u16,
+    /// RTA: frequency of each point.
+    pub axis_hz: Vec<f32>,
+    /// SCOPE: time of each point from the window start.
+    pub axis_seconds: Vec<f32>,
 }
 
 /// Server-side events.
@@ -212,17 +239,22 @@ impl Engine {
             id
         };
         let scale = session.device.scale(Direction::Input);
+        // Frames are ready to plot: dBFS, or dBV when the device is calibrated.
+        let offset_db = match scale {
+            Scale::Dbfs => 0.0,
+            Scale::Volts { dbv_offset } => dbv_offset,
+        };
+        let too_many = |n: usize| {
+            u16::try_from(n).map_err(|_| EngineError::BadRequest("more than 65535 points".into()))
+        };
+        let mut axis_hz = Vec::new();
+        let mut axis_seconds = Vec::new();
         let (values_per_channel, processor): (u16, Processor) = match req.kind {
             StreamKind::Levels => {
                 let rate = if req.levels_rate_hz <= 0.0 {
                     20.0
                 } else {
                     req.levels_rate_hz
-                };
-                // Level frames are ready to plot: dBFS, or dBV when the device is calibrated.
-                let offset_db = match scale {
-                    Scale::Dbfs => 0.0,
-                    Scale::Volts { dbv_offset } => dbv_offset,
                 };
                 (
                     2,
@@ -232,11 +264,28 @@ impl Engine {
                     ),
                 )
             }
-            StreamKind::RawInput => (
-                u16::try_from(block_frames)
-                    .map_err(|_| EngineError::BadRequest("block_frames > 65535".into()))?,
-                Processor::Raw,
-            ),
+            StreamKind::RawInput => (too_many(block_frames as usize)?, Processor::Raw),
+            StreamKind::Rta => {
+                let cfg = req.rta.unwrap_or_default();
+                if !cfg.fft_length.is_power_of_two() || cfg.fft_length < 16 {
+                    return Err(EngineError::BadRequest(
+                        "fft_length must be a power of two >= 16".into(),
+                    ));
+                }
+                let rta = analyzers::rta::Rta::new(&cfg, channels, applied.sample_rate, offset_db);
+                axis_hz = rta.axis_hz().to_vec();
+                (too_many(rta.points())?, Processor::Rta(rta))
+            }
+            StreamKind::Scope => {
+                let cfg = req.scope.unwrap_or(ScopeConfig {
+                    window_frames: block_frames as usize,
+                    points: 0,
+                    trigger: None,
+                });
+                let scope = analyzers::scope::Scope::new(&cfg, channels, applied.sample_rate);
+                axis_seconds = scope.axis_seconds();
+                (too_many(scope.points())?, Processor::Scope(scope))
+            }
         };
         let info = StreamInfo {
             stream_id,
@@ -246,6 +295,8 @@ impl Engine {
             sample_rate: applied.sample_rate,
             scale,
             values_per_channel,
+            axis_hz,
+            axis_seconds,
         };
 
         let (tx, rx) = mpsc::channel::<InputBlock>(64);
@@ -397,6 +448,29 @@ impl Engine {
 enum Processor {
     Levels(levels::LevelMeter),
     Raw,
+    Rta(analyzers::rta::Rta),
+    Scope(analyzers::scope::Scope),
+}
+
+/// Send one channel-major frame and bump the sequence number.
+fn emit(
+    frames: &broadcast::Sender<Arc<Frame>>,
+    stream_id: u32,
+    seq: &mut u64,
+    first_frame: u64,
+    channels: u16,
+    values: Vec<f32>,
+) {
+    let values_per_channel = (values.len() / channels.max(1) as usize) as u16;
+    let _ = frames.send(Arc::new(Frame {
+        stream_id,
+        seq: *seq,
+        first_frame,
+        channels,
+        values_per_channel,
+        values,
+    }));
+    *seq += 1;
 }
 
 async fn pump(
@@ -424,27 +498,49 @@ async fn pump(
                         values[c * n + i] = *v;
                     }
                 }
-                let _ = frames.send(Arc::new(Frame {
+                emit(
+                    &frames,
                     stream_id,
-                    seq,
-                    first_frame: block.first_frame,
-                    channels: block.channels,
-                    values_per_channel: block.frames as u16,
+                    &mut seq,
+                    block.first_frame,
+                    block.channels,
                     values,
-                }));
-                seq += 1;
+                );
             }
             Processor::Levels(meter) => {
-                for reading in meter.push(&block) {
-                    let _ = frames.send(Arc::new(Frame {
+                for r in meter.push(&block) {
+                    emit(
+                        &frames,
                         stream_id,
-                        seq,
-                        first_frame: reading.first_frame,
-                        channels: block.channels,
-                        values_per_channel: 2,
-                        values: reading.values,
-                    }));
-                    seq += 1;
+                        &mut seq,
+                        r.first_frame,
+                        block.channels,
+                        r.values,
+                    );
+                }
+            }
+            Processor::Rta(rta) => {
+                for r in rta.push(&block) {
+                    emit(
+                        &frames,
+                        stream_id,
+                        &mut seq,
+                        r.first_frame,
+                        block.channels,
+                        r.values,
+                    );
+                }
+            }
+            Processor::Scope(scope) => {
+                for r in scope.push(&block) {
+                    emit(
+                        &frames,
+                        stream_id,
+                        &mut seq,
+                        r.first_frame,
+                        block.channels,
+                        r.values,
+                    );
                 }
             }
         }
