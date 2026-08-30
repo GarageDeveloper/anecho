@@ -21,7 +21,9 @@ import { Client, ServerError } from "./client";
 import { generator } from "./generator.svelte";
 import { channelValues, type Frame } from "./wire";
 
-export const API_URL = "ws://127.0.0.1:4800/ws";
+// Overridable for development against the mock: `VITE_ANECHO_URL=ws://127.0.0.1:4811/ws pnpm dev`.
+export const API_URL: string =
+  (import.meta.env?.VITE_ANECHO_URL as string | undefined) ?? "ws://127.0.0.1:4800/ws";
 
 export type Tab = "levels" | "rta" | "scope";
 export type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -84,7 +86,12 @@ class ScopeSettings {
   triggerChannel = $state(0);
 }
 
+/**
+ * One-shot distortion measurements reuse the RTA analysis settings (FFT length, window,
+ * average count) unless overridden — one place to think about the analysis.
+ */
 class MeasureSettings {
+  override = $state(false);
   fftLength = $state(65536);
   window = $state<RtaConfig_Window>(RtaConfig_Window.BLACKMAN_HARRIS_7);
   averages = $state(4);
@@ -118,6 +125,8 @@ class AppState {
   cursor = $state<CursorReadout | null>(null);
   /** True while a running stream is stopped and started again after a control change. */
   restarting = $state(false);
+  /** True while a stream is paused for a one-shot measurement and will resume after it. */
+  measuringPaused = $state(false);
   rta = new RtaSettings();
   scope = new ScopeSettings();
   measure = new MeasureSettings();
@@ -135,6 +144,17 @@ class AppState {
 
   get calibrated(): boolean {
     return this.selectedDevice?.factoryCalibrated ?? false;
+  }
+
+  /** Analysis settings a one-shot measurement will use: the RTA's, unless overridden. */
+  get measureEffective(): { fftLength: number; window: RtaConfig_Window; averages: number } {
+    const m = this.measure;
+    if (m.override) return { fftLength: m.fftLength, window: m.window, averages: m.averages };
+    const r = this.rta;
+    const counted =
+      r.averagingMode === RtaConfig_Averaging_Mode.LINEAR ||
+      r.averagingMode === RtaConfig_Averaging_Mode.EXPONENTIAL;
+    return { fftLength: r.fftLength, window: r.window, averages: counted ? r.averagingCount : 1 };
   }
 
   async connect() {
@@ -366,27 +386,33 @@ class AppState {
     }
   }
 
-  /** One-shot distortion measurement on the current device (no stream may be running). */
+  /**
+   * One-shot distortion measurement on the current device. The backend refuses to measure
+   * while a stream runs (one capture at a time), so a running stream is paused for the
+   * measurement and resumed afterwards.
+   */
   async runMeasure(kind: MeasureKind) {
     const c = this.client;
-    if (!c || this.measure.busy) return;
-    if (this.running) {
-      this.error = "stop the stream before measuring";
-      return;
-    }
+    if (!c || this.measure.busy || this.restarting) return;
     this.measure.busy = true;
     this.measure.kind = kind;
     this.error = "";
+    const wasRunning = this.running;
     try {
+      if (wasRunning) {
+        this.measuringPaused = true;
+        await this.stopStream();
+      }
       const sessionId = await this.ensureSession();
       if (sessionId === null) return;
+      const eff = this.measureEffective;
       const req = create(MeasureRequestSchema, {
         sessionId,
         kind,
         generator: generator.message(this.calibrated),
-        fftLength: this.measure.fftLength,
-        window: this.measure.window,
-        averages: this.measure.averages,
+        fftLength: eff.fftLength,
+        window: eff.window,
+        averages: eff.averages,
         maxHarmonic: this.measure.maxHarmonic,
       });
       this.measure.result = await c.measure(req);
@@ -396,6 +422,10 @@ class AppState {
       this.error = describe(e);
     } finally {
       this.measure.busy = false;
+      if (wasRunning) {
+        this.measuringPaused = false;
+        await this.startStream();
+      }
     }
   }
 

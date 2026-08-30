@@ -5,6 +5,7 @@
   import "uplot/dist/uPlot.min.css";
   import { onMount } from "svelte";
   import type { CursorReadout } from "../lib/stores.svelte";
+  import { channelBars, nearestSlot, slotWidth } from "../lib/bars";
 
   interface Props {
     axis: number[];
@@ -77,6 +78,35 @@
     return [axis, ...series.map((v) => Array.from(v))];
   }
 
+  /** Pixel X (canvas space) of every X value of the data. */
+  function centresPx(u: uPlot): number[] {
+    return (u.data[0] as number[]).map((x) => u.valToPos(x, "x", true));
+  }
+
+  /**
+   * Grouped bars: for series `sidx`, one rectangle per band from the bottom of the plot up
+   * to the value, the channels of a band side by side. Explicit geometry (lib/bars.ts)
+   * instead of uPlot's bar builder, whose baseline is the Y zero.
+   */
+  function groupedBars(u: uPlot, sidx: number): uPlot.Series.Paths {
+    const centres = centresPx(u);
+    const slot = slotWidth(centres, u.bbox.width);
+    const bottom = u.bbox.top + u.bbox.height;
+    const rects = channelBars(
+      centres,
+      u.data[sidx] as (number | null)[],
+      sidx - 1,
+      u.series.length - 1,
+      slot,
+      bottom,
+      (v) => u.valToPos(v, "y", true),
+    );
+    const fill = new Path2D();
+    for (const r of rects) fill.rect(r.x, r.y, r.w, r.h);
+    // Same outline as fill; uPlot strokes and fills these with the series colours.
+    return { stroke: fill, fill, clip: null };
+  }
+
   function build() {
     plot?.destroy();
     plot = null;
@@ -87,19 +117,10 @@
       s.push({
         label: seriesNames[i] ?? `CH ${i + 1}`,
         stroke: color,
-        width: 1.5,
+        width: 1,
         points: { show: false },
-        // Bars rise from the bottom of the Y scale, not from 0 (levels are negative dB).
-        paths: bars
-          ? uPlot.paths.bars!({
-              size: [0.7, 40],
-              align: 0,
-              disp: {
-                y0: { unit: 1, values: (u, sidx) => (u.data[sidx] as number[]).map(() => yRange[0]) },
-              },
-            })
-          : undefined,
-        fill: bars ? color + "55" : undefined,
+        paths: bars ? (u, sidx) => groupedBars(u, sidx) : undefined,
+        fill: bars ? color + "88" : undefined,
       });
     }
     const [yMin, yMax] = yRange;
@@ -135,10 +156,15 @@
         setCursor: [
           (u) => {
             if (!onCursor) return;
-            const idx = u.cursor.idx;
             // Leaving the graph keeps the last readout (the inspector shows it until cleared).
-            if (idx == null || idx < 0) return;
-            const x = u.data[0][idx];
+            const left = u.cursor.left;
+            if (left == null || left < 0) return;
+            // Snap to the data point (band or log point) nearest to the pointer, and read
+            // the values from the data itself — never from the pixel position.
+            const leftPx = left * (window.devicePixelRatio || 1);
+            const idx = nearestSlot(centresPx(u), leftPx);
+            if (idx < 0) return;
+            const x = u.data[0][idx] as number;
             const values = u.data.slice(1).map((d) => (d[idx] == null ? null : (d[idx] as number)));
             onCursor({ x, values });
           },

@@ -81,7 +81,7 @@
   </section>
 
   <section>
-    <h2>Measure</h2>
+    <h2>Distortion (one-shot)</h2>
     <MeasurePanel />
   </section>
 

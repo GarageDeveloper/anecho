@@ -225,6 +225,8 @@ function handle(ws: WebSocket, payload: Payload, owned: Set<bigint>): Payload {
               outputRanges: OUTPUT_RANGES.map((r) => ({ $typeName: "anecho.v0.Range", fullScaleDbv: r, label: `${r >= 0 ? "+" : ""}${r} dBV` })),
               synchronousIo: true,
               nominalLatencyFrames: 46,
+              // Real units report it once opened; the mock knows it upfront.
+              firmwareVersion: "60",
             },
             {
               $typeName: "anecho.v0.DeviceInfo",
@@ -239,6 +241,7 @@ function handle(ws: WebSocket, payload: Payload, owned: Set<bigint>): Payload {
               inputRanges: [],
               outputRanges: [],
               synchronousIo: false,
+              firmwareVersion: "",
             },
           ],
         },

@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { app, FFT_LENGTHS, WINDOWS } from "../lib/stores.svelte";
+  // One-shot distortion measurements (THD, IMD). They reuse the RTA analysis settings
+  // unless "Override" is on; a running stream is paused and resumed around the measurement.
+  import { app, FFT_LENGTHS, WINDOWS, windowLabel } from "../lib/stores.svelte";
   import { generator } from "../lib/generator.svelte";
   import { MeasureKind } from "../gen/anecho_pb";
 
@@ -10,11 +12,12 @@
   ];
 
   const canMeasure = $derived(
-    app.connection === "connected" && !!app.selectedDevice && !app.running && !app.measure.busy,
+    app.connection === "connected" && !!app.selectedDevice && !app.measure.busy && !app.restarting,
   );
   const isImd = $derived(
     app.measure.result?.kind === MeasureKind.IMD_SMPTE || app.measure.result?.kind === MeasureKind.IMD_CCIF,
   );
+  const eff = $derived(app.measureEffective);
 
   function pct(v: number): string {
     return v < 0.01 ? v.toExponential(2) : v.toFixed(4);
@@ -22,17 +25,31 @@
 </script>
 
 <div class="measure">
+  <p class="muted small settings">
+    {#if app.measure.override}
+      Own analysis settings:
+    {:else}
+      Uses the RTA settings:
+    {/if}
+    <span class="mono">{eff.fftLength / 1024}k · {windowLabel(eff.window)} · ×{eff.averages}</span>
+  </p>
+  <label class="toggle small">
+    <input type="checkbox" bind:checked={app.measure.override} disabled={app.measure.busy} />
+    Override
+  </label>
   <div class="grid">
-    <label for="mfft">FFT</label>
-    <select id="mfft" bind:value={app.measure.fftLength} disabled={app.measure.busy}>
-      {#each FFT_LENGTHS as n (n)}<option value={n}>{n / 1024}k</option>{/each}
-    </select>
-    <label for="mwin">Window</label>
-    <select id="mwin" bind:value={app.measure.window} disabled={app.measure.busy}>
-      {#each WINDOWS as w (w.value)}<option value={w.value}>{w.label}</option>{/each}
-    </select>
-    <label for="mavg">Averages</label>
-    <input id="mavg" type="number" min="1" max="64" bind:value={app.measure.averages} disabled={app.measure.busy} />
+    {#if app.measure.override}
+      <label for="mfft">FFT</label>
+      <select id="mfft" bind:value={app.measure.fftLength} disabled={app.measure.busy}>
+        {#each FFT_LENGTHS as n (n)}<option value={n}>{n / 1024}k</option>{/each}
+      </select>
+      <label for="mwin">Window</label>
+      <select id="mwin" bind:value={app.measure.window} disabled={app.measure.busy}>
+        {#each WINDOWS as w (w.value)}<option value={w.value}>{w.label}</option>{/each}
+      </select>
+      <label for="mavg">Averages</label>
+      <input id="mavg" type="number" min="1" max="64" bind:value={app.measure.averages} disabled={app.measure.busy} />
+    {/if}
     <label for="mh">Harmonics</label>
     <input id="mh" type="number" min="2" max="20" bind:value={app.measure.maxHarmonic} disabled={app.measure.busy} />
   </div>
@@ -53,7 +70,7 @@
     {:else}
       Uses the rail generator: {generator.summary}.
     {/if}
-    {#if app.running}<br />Stop the stream to measure.{/if}
+    {#if app.running || app.measuringPaused}<br />The stream pauses during the measurement and resumes after it.{/if}
   </p>
 
   {#if app.measure.result}
@@ -98,6 +115,17 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  .settings {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+  }
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
   }
   .grid {
     display: grid;

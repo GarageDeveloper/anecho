@@ -57,9 +57,11 @@
     </section>
     <section>
       <h2>4 · Capture</h2>
-      {#if app.running || app.restarting}
-        <button onclick={() => app.stop()}>Stop</button>
-        <div class="state ok">{app.restarting ? "restarting…" : `streaming ${app.tab}`}</div>
+      {#if app.running || app.restarting || app.measuringPaused}
+        <button onclick={() => app.stop()} disabled={app.measuringPaused}>Stop</button>
+        <div class="state ok">
+          {app.measuringPaused ? "measuring…" : app.restarting ? "restarting…" : `streaming ${app.tab}`}
+        </div>
       {:else}
         <button
           class="primary"
