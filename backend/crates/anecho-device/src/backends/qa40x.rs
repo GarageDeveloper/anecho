@@ -402,7 +402,31 @@ impl MeasurementDevice for Qa40xDevice {
         let gain = InputGain::from_dbv(dbv)
             .ok_or_else(|| DeviceError::UnsupportedConfig(format!("input range {dbv} dBV")))?;
         let dev = self.handle.lock().await;
+        // Diagnostic hook (E10): hold the device for a while *before* a live range write
+        // (i.e. after the previous chunk's STREAM_STOP).
+        if let Some(ms) = std::env::var("ANECHO_QA40X_RANGE_PREPAUSE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         dev.set_input_gain(gain).await.map_err(map_qerr)?;
+        // Diagnostic hook (E17): a short silent capture right after a live write.
+        if std::env::var_os("ANECHO_QA40X_RANGE_SILENT_CAPTURE").is_some() {
+            dev.acquire_data(4096).await.map_err(map_qerr)?;
+        }
+        // Diagnostic hook (E14): clear the data endpoints' halt state after a live write.
+        if std::env::var_os("ANECHO_QA40X_RANGE_CLEAR_HALT").is_some() {
+            dev.clear_data_endpoints().await.map_err(map_qerr)?;
+        }
+        // Diagnostic hook (E8): hold the device — and therefore the stream worker — for a
+        // while after a live range write.
+        if let Some(ms) = std::env::var("ANECHO_QA40X_RANGE_PAUSE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         let (in_off, _) = dev.input_dbv_offset(Channel::Left).await;
         drop(dev);
         self.offsets_dbv.lock().unwrap().0 = in_off;
@@ -594,7 +618,9 @@ impl Worker {
 
         // Latency compensation only matters when we drive the outputs.
         let offsets = *self.offsets_dbv.lock().unwrap();
-        let pad = if self.cfg.generate && (drive_l || drive_r) {
+        // Diagnostic hook (E18): skip the latency probe at stream start.
+        let skip_probe = std::env::var_os("ANECHO_QA40X_SKIP_LATENCY_PROBE").is_some();
+        let pad = if self.cfg.generate && (drive_l || drive_r) && !skip_probe {
             match probe_latency(
                 &self.handle,
                 &self.cancel,

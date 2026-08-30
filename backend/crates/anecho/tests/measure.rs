@@ -6,8 +6,6 @@ use anecho_device::DeviceRegistry;
 use anecho_device::backends::virtual_loopback::{LoopbackOptions, VirtualLoopbackBackend};
 use anecho_engine::Engine;
 use std::sync::Arc;
-#[cfg(feature = "qa40x-sim")]
-use std::time::Duration;
 
 async fn serve(registry: DeviceRegistry) -> (String, tokio::sync::oneshot::Sender<()>) {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -273,90 +271,4 @@ async fn thd_on_the_simulated_qa40x() {
         r.thd_pct
     );
     client.close_session(session.session_id).await.unwrap();
-}
-
-/// Input auto-range on the simulated QA40x: from the 42 dBV range down to the range that
-/// fits a −20 dBV sine, with the level meter unchanged in dBV across every switch.
-#[cfg(feature = "qa40x-sim")]
-#[tokio::test]
-async fn input_auto_range_steps_down_and_keeps_dbv_readings() {
-    use anecho_device::backends::qa40x::Qa40xBackend;
-    let (url, _stop) = serve(
-        DeviceRegistry::new().with_backend(Arc::new(Qa40xBackend::empty().with_simulator(false))),
-    )
-    .await;
-    let client = Client::connect(&url).await.unwrap();
-    let dev = client.list_devices().await.unwrap().remove(0);
-    let top = dev.input_ranges.len() as u32 - 1;
-    assert_eq!(dev.input_ranges[top as usize].full_scale_dbv, 42.0);
-    let session = client
-        .open_session(
-            &dev.id,
-            pb::DeviceConfig {
-                sample_rate: 48_000,
-                input_range: Some(top),
-                auto_range_input: Some(true),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let mut events = client.events();
-    let mut frames = client.frames();
-    let stream = client
-        .start_stream(pb::StartStreamRequest {
-            session_id: session.session_id,
-            kind: pb::StreamKind::Levels as i32,
-            block_frames: 4096,
-            levels_rate_hz: 10.0,
-            generator: Some(tone(
-                pb::generator::Signal::Sine(pb::generator::Sine {
-                    frequency_hz: 1000.0,
-                    amplitude_dbfs: 0.0,
-                }),
-                pb::generator::level::Unit::DbvRms(-20.0),
-            )),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    // Collect range changes until the range stops moving (≤ 30 s of simulated audio).
-    let mut ranges = Vec::new();
-    let mut readings: Vec<f32> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        tokio::select! {
-            ev = events.recv() => {
-                if let Ok(pb::Event { kind: Some(pb::event::Kind::RangeChanged(r)) }) = ev
-                    && let Some(i) = r.input_range
-                {
-                    ranges.push(i);
-                }
-            }
-            f = frames.recv() => {
-                if let Ok(f) = f && f.stream_id == stream.stream_id {
-                    readings.push(f.channel(0)[0]);
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => panic!("auto-range never settled"),
-        }
-        // −20 dBV RMS: at 0 dBV the peak is −20+3−3.6 ≈ −20.6 dBFS (< −18, still "low"),
-        // so the policy goes all the way down to range 0.
-        if ranges.last() == Some(&0) && readings.len() >= 20 {
-            break;
-        }
-    }
-    // Strictly descending, one step at a time.
-    assert_eq!(ranges[0], top - 1, "{ranges:?}");
-    assert!(ranges.windows(2).all(|w| w[1] + 1 == w[0]), "{ranges:?}");
-    assert_eq!(*ranges.last().unwrap(), 0);
-    // Readings stay at −20 dBV (±0.5) whatever the range, apart from the block during
-    // which the relay switched (allow a few outliers).
-    let outliers = readings.iter().filter(|v| (**v + 20.0).abs() > 0.5).count();
-    assert!(
-        outliers <= ranges.len() + 2,
-        "{outliers} outliers in {readings:?}"
-    );
-    client.stop_stream(stream.stream_id).await.unwrap();
 }

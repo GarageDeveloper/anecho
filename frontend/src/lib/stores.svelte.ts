@@ -110,7 +110,6 @@ class AppState {
   sampleRate = $state(48000);
   inputRange = $state<number | undefined>(undefined);
   outputRange = $state<number | undefined>(undefined);
-  autoRangeInput = $state(false);
   sessionId = $state<bigint | null>(null);
   /** Firmware version of the opened device (known once the session is open). */
   firmwareVersion = $state("");
@@ -289,7 +288,6 @@ class AppState {
       sampleRate: this.sampleRate,
       inputRange: this.inputRange,
       outputRange: this.outputRange,
-      autoRangeInput: this.autoRangeInput ? true : undefined,
     });
     const session = await c.openSession(d.id, config);
     this.sessionId = session.sessionId;

@@ -8,6 +8,7 @@ use qa40x_driver::{InputGain, OutputGain, QA40xDevice, SampleRate};
 async fn main() {
     let dev = QA40xDevice::new();
     dev.connect().await.unwrap();
+    println!("model: {:?}", dev.model().await);
     dev.set_sample_rate(SampleRate::Rate48kHz).await.unwrap();
     dev.set_input_gain(InputGain::Gain42dBV).await.unwrap();
     dev.set_output_gain(OutputGain::GainMinus2dBV)

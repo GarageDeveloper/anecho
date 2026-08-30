@@ -2,7 +2,6 @@
 //! data ([`Frame`]s) so that no client ever computes anything.
 
 pub mod analyzers;
-pub mod autorange;
 pub mod generator;
 pub mod levels;
 pub mod measure;
@@ -117,8 +116,6 @@ struct Session {
     stream: Option<RunningStream>,
     /// A one-shot measurement is using the device.
     measuring: bool,
-    /// Input auto-range requested at open.
-    auto_range: bool,
 }
 
 struct RunningStream {
@@ -194,7 +191,13 @@ impl Engine {
                 }
             }
         };
-        let auto_range = config.auto_range_input;
+        if config.auto_range_input {
+            return Err(EngineError::BadRequest(
+                "input auto-range is not available: changing the input range while a QA40x \
+                 streams was found to corrupt its captures; set the range explicitly"
+                    .into(),
+            ));
+        }
         let applied = device.configure(config).await?;
         let descriptor = device.descriptor().clone();
         let id = {
@@ -209,7 +212,6 @@ impl Engine {
                 device,
                 stream: None,
                 measuring: false,
-                auto_range,
             },
         );
         Ok((id, applied, descriptor))
@@ -241,15 +243,6 @@ impl Engine {
             .applied_config()
             .await
             .ok_or(DeviceError::NotConfigured)?;
-        let auto_range = if session.auto_range {
-            autorange::AutoRange::new(
-                session.device.clone(),
-                applied.input_range.unwrap_or(0),
-                applied.sample_rate,
-            )
-        } else {
-            None
-        };
         let mut block_frames = if req.block_frames == 0 {
             4096
         } else {
@@ -361,7 +354,6 @@ impl Engine {
             processor,
             self.frames.clone(),
             self.events.clone(),
-            auto_range.map(|a| (a, session_id, session.device.clone())),
         ));
         session.stream = Some(RunningStream {
             info: info.clone(),
@@ -517,15 +509,12 @@ fn emit(
     *seq += 1;
 }
 
-type AutoRangeCtx = (autorange::AutoRange, u64, Arc<dyn MeasurementDevice>);
-
 async fn pump(
     mut rx: mpsc::Receiver<InputBlock>,
     stream_id: u32,
     mut processor: Processor,
     frames: broadcast::Sender<Arc<Frame>>,
     events: broadcast::Sender<Event>,
-    mut auto_range: Option<AutoRangeCtx>,
 ) {
     let mut seq: u64 = 0;
     while let Some(block) = rx.recv().await {
@@ -545,15 +534,6 @@ async fn pump(
             Processor::Levels(m) => m.set_offset_db(block_offset),
             Processor::Rta(r) => r.set_offset_db(block_offset),
             Processor::Raw | Processor::Scope(_) => {}
-        }
-        if let Some((ar, session_id, _device)) = auto_range.as_mut()
-            && let Some(new_range) = ar.observe(&block).await
-        {
-            let _ = events.send(Event::RangeChanged {
-                session_id: *session_id,
-                input_range: Some(new_range),
-                output_range: None,
-            });
         }
         match &mut processor {
             Processor::Raw => {

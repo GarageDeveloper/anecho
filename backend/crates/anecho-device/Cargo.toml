@@ -72,3 +72,11 @@ required-features = ["qa40x"]
 [[example]]
 name = "qa40x_channel_check"
 required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_restart_probe"
+required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_recover_probe"
+required-features = ["qa40x"]

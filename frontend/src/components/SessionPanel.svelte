@@ -16,13 +16,11 @@
 
     {#if d.inputRanges.length > 0}
       <label for="in">Input range</label>
-      <select id="in" bind:value={app.inputRange} disabled={locked || app.autoRangeInput}>
+      <select id="in" bind:value={app.inputRange} disabled={locked}>
         {#each d.inputRanges as r, i (i)}
           <option value={i}>{r.label}</option>
         {/each}
       </select>
-      <label for="ar">Auto range</label>
-      <input id="ar" type="checkbox" bind:checked={app.autoRangeInput} disabled={locked} />
     {/if}
 
     {#if d.outputRanges.length > 0}
