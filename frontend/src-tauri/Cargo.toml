@@ -1,0 +1,27 @@
+[package]
+name = "anecho-desktop"
+description = "Anecho desktop shell: Tauri window around the headless backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "anecho_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+anecho = { path = "../../backend/crates/anecho" }
+anecho-server = { path = "../../backend/crates/anecho-server" }
+tokio = { workspace = true, features = ["full"] }
+log.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true

@@ -7,7 +7,7 @@ ifeq ($(CONTRACT_BASE),)
 CONTRACT_BASE := main
 endif
 
-.PHONY: help contract-check contract-lint generate build test fmt fmt-check lint check serve dev testbench clean
+.PHONY: help contract-check contract-lint generate build test fmt fmt-check lint check serve dev testbench frontend-check clean
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -41,7 +41,10 @@ fmt-check:
 lint: ## Clippy, warnings are errors
 	cargo clippy --workspace --all-targets -- -D warnings
 
-check: fmt-check lint test contract-check ## Everything CI runs
+frontend-check: generate ## Type-check and build the web frontend
+	cd frontend && pnpm install --frozen-lockfile && pnpm exec svelte-check --tsconfig ./tsconfig.json && pnpm exec vite build
+
+check: fmt-check lint test contract-check frontend-check ## Everything CI runs
 
 serve: ## Run the headless backend
 	cargo run -p anecho -- serve

@@ -7,3 +7,9 @@ dist/
 
 # Generated contract types (TypeScript)
 frontend/src/gen/
+
+# Frontend build artefacts
+frontend/dist/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/schemas/
+frontend/icon-src.png
