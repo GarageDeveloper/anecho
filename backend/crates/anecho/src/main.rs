@@ -54,6 +54,9 @@ enum Cmd {
         device: String,
         #[arg(long, default_value_t = 48_000)]
         sample_rate: u32,
+        /// Input range index (see `devices`); default: the device's safe default.
+        #[arg(long)]
+        input_range: Option<u32>,
         /// Drive the outputs with a sine: `<frequency_hz>,<amplitude_dbfs>` (alias of
         /// `--signal sine:<hz> --level <dbfs>dBFS`).
         #[arg(long)]
@@ -78,6 +81,9 @@ enum Cmd {
         device: String,
         #[arg(long, default_value_t = 48_000)]
         sample_rate: u32,
+        /// Input range index (see `devices`); default: the device's safe default.
+        #[arg(long)]
+        input_range: Option<u32>,
         #[arg(long, default_value_t = 16_384)]
         fft: u32,
         /// rect, hann, bh4, bh7, flattop.
@@ -111,6 +117,9 @@ enum Cmd {
         device: String,
         #[arg(long, default_value_t = 48_000)]
         sample_rate: u32,
+        /// Input range index (see `devices`); default: the device's safe default.
+        #[arg(long)]
+        input_range: Option<u32>,
         #[arg(long, default_value_t = 480)]
         window_frames: u32,
         #[arg(long, default_value_t = 48)]
@@ -160,6 +169,7 @@ async fn run_stream(
     url: &str,
     device: &str,
     sample_rate: u32,
+    input_range: Option<u32>,
     req: pb::StartStreamRequest,
     seconds: f64,
 ) -> anyhow::Result<(pb::StartStreamResponse, Option<anecho_wire::Frame>, usize)> {
@@ -169,6 +179,7 @@ async fn run_stream(
             device,
             pb::DeviceConfig {
                 sample_rate,
+                input_range,
                 ..Default::default()
             },
         )
@@ -257,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
             url,
             device,
             sample_rate,
+            input_range,
             sine,
             signal,
             level,
@@ -269,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
                     &device,
                     pb::DeviceConfig {
                         sample_rate,
+                        input_range,
                         ..Default::default()
                     },
                 )
@@ -311,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
             url,
             device,
             sample_rate,
+            input_range,
             fft,
             window,
             averaging,
@@ -340,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             let (stream, last, count) =
-                run_stream(&url, &device, sample_rate, req, seconds).await?;
+                run_stream(&url, &device, sample_rate, input_range, req, seconds).await?;
             let unit = unit_of(stream.scale.as_ref());
             let Some(f) = last else {
                 anyhow::bail!("no RTA frame received in {seconds} s");
@@ -376,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
             url,
             device,
             sample_rate,
+            input_range,
             window_frames,
             points,
             trigger,
@@ -406,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             let (stream, last, count) =
-                run_stream(&url, &device, sample_rate, req, seconds).await?;
+                run_stream(&url, &device, sample_rate, input_range, req, seconds).await?;
             let Some(f) = last else {
                 anyhow::bail!("no scope frame received in {seconds} s");
             };
