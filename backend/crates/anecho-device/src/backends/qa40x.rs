@@ -201,6 +201,7 @@ impl DeviceBackend for Qa40xBackend {
             state: Mutex::new(State::default()),
             offsets_dbv: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
             measured_latency: Arc::new(std::sync::Mutex::new(None)),
+            insertions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }))
     }
 }
@@ -227,6 +228,8 @@ pub struct Qa40xDevice {
     offsets_dbv: Arc<std::sync::Mutex<(f32, f32)>>,
     /// Round-trip latency measured at the last generating stream start, in frames.
     measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
+    /// Captures discarded because they carried inserted stimulus data.
+    insertions: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Qa40xDevice {
@@ -238,6 +241,12 @@ impl std::fmt::Debug for Qa40xDevice {
 }
 
 impl Qa40xDevice {
+    /// Number of captures discarded so far because the device returned stimulus data
+    /// inside the ADC stream (seen on a QA402, fw 60, in a degraded state cleared by a USB power cycle).
+    pub fn discarded_captures(&self) -> u64 {
+        self.insertions.load(Ordering::Relaxed)
+    }
+
     fn range_dbv(ranges: &[Range], idx: Option<usize>, default: usize) -> Result<i32> {
         let i = idx.unwrap_or(default);
         ranges
@@ -340,6 +349,7 @@ impl MeasurementDevice for Qa40xDevice {
             cancel: cancel.clone(),
             measured_latency: self.measured_latency.clone(),
             offsets_dbv: self.offsets_dbv.clone(),
+            insertions: self.insertions.clone(),
         };
         let task = tokio::spawn(worker.run());
         st.running = Some(Running {
@@ -413,6 +423,75 @@ struct Worker {
     cancel: Arc<AtomicBool>,
     measured_latency: Arc<std::sync::Mutex<Option<usize>>>,
     offsets_dbv: Arc<std::sync::Mutex<(f32, f32)>>,
+    /// Captures discarded because they carried inserted stimulus data.
+    insertions: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Quantised key of a sample for stimulus matching: the top 24 bits of its i32 form,
+/// which survive the DAC encode / ADC decode round trip of an inserted (digital) copy.
+#[inline]
+fn tx_key(v: f32) -> i32 {
+    ((v.clamp(-1.0, 1.0) as f64 * 2_147_483_648.0) as i32) >> 8
+}
+
+/// Length of the exact-match window used to recognise inserted stimulus data.
+const INSERTION_WINDOW: usize = 4;
+/// Ignore windows that are all (near) zero: silence matches silence trivially.
+const INSERTION_MIN_KEY: i32 = 1 << 4;
+/// Captures found to contain inserted stimulus data are redone up to this many times.
+const INSERTION_RETRIES: usize = 3;
+
+/// Exact zeros in a row that cannot come from an ADC (its noise floor never yields
+/// 32 consecutive exact zeros) — inserted DAC lead-in / padding.
+const INSERTION_ZERO_RUN: usize = 32;
+
+/// Set of every `INSERTION_WINDOW`-sample window of the given stimulus buffers (the
+/// current call's left and right channels and the previous call's, whose tail the
+/// device may still hold in its DAC FIFO).
+fn tx_windows(buffers: &[&[f32]]) -> std::collections::HashSet<[i32; INSERTION_WINDOW]> {
+    let mut set = std::collections::HashSet::new();
+    for tx in buffers {
+        let keys: Vec<i32> = tx.iter().map(|&v| tx_key(v)).collect();
+        set.extend(
+            keys.windows(INSERTION_WINDOW)
+                .filter(|w| w.iter().any(|k| k.abs() >= INSERTION_MIN_KEY))
+                .map(|w| [w[0], w[1], w[2], w[3]]),
+        );
+    }
+    set
+}
+
+/// Number of captured windows that are bit-exact copies of stimulus windows.
+///
+/// QA402 (fw 60) sometimes returns 1 KiB of the DAC stream every 20 KiB of ADC data
+///. A real loopback never reproduces the digital stimulus to 24
+/// bits, so any exact window is an inserted one.
+fn inserted_windows(
+    captured: &[f32],
+    tx: &std::collections::HashSet<[i32; INSERTION_WINDOW]>,
+) -> usize {
+    let keys: Vec<i32> = captured.iter().map(|&v| tx_key(v)).collect();
+    let matches = if tx.is_empty() {
+        0
+    } else {
+        keys.windows(INSERTION_WINDOW)
+            .filter(|w| tx.contains(&[w[0], w[1], w[2], w[3]]))
+            .count()
+    };
+    // Runs of exact zeros (raw i32 == 0): inserted silence from the DAC stream.
+    let mut zero_runs = 0;
+    let mut run = 0usize;
+    for &v in captured {
+        if v == 0.0 {
+            run += 1;
+            if run == INSERTION_ZERO_RUN {
+                zero_runs += 1;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    matches + zero_runs
 }
 
 /// Linear chirp, `LATENCY_CHIRP_FRAMES` long, zero-padded to `LATENCY_PROBE_FRAMES`.
@@ -556,6 +635,8 @@ impl Worker {
         let mut inter = vec![0f32; chunk * 2];
         let mut left = vec![0f32; chunk + pad];
         let mut right = vec![0f32; chunk + pad];
+        let mut prev_left: Vec<f32> = Vec::new();
+        let mut prev_right: Vec<f32> = Vec::new();
 
         while !self.cancel.load(Ordering::Relaxed) && !self.blocker.is_closed() {
             inter.iter_mut().for_each(|s| *s = 0.0);
@@ -572,20 +653,50 @@ impl Worker {
             // The device mutex stays held until the chunk's blocks are handed over: a range
             // write waiting on the mutex (`set_input_range`) then always lands *between* the
             // blocks of two chunks, so every block is captured entirely on one range.
-            let dev = self.handle.lock().await;
-            let res = dev
-                .generate_and_capture_cancellable(&left, &right, Some(&self.cancel))
-                .await;
-            let audio = match res {
-                Ok(a) => a,
-                Err(e) => {
-                    if !self.cancel.load(Ordering::Relaxed) {
-                        log::warn!("qa40x capture failed: {e}");
-                    }
-                    break;
-                }
+            // Captures carrying inserted stimulus data are redone; the
+            // mutex is released between attempts so a pending range write can land.
+            let tx = if self.cfg.generate {
+                tx_windows(&[&left, &right, &prev_left, &prev_right])
+            } else {
+                Default::default()
             };
+            let mut captured = None;
+            for attempt in 0..INSERTION_RETRIES {
+                let dev = self.handle.lock().await;
+                let res = dev
+                    .generate_and_capture_cancellable(&left, &right, Some(&self.cancel))
+                    .await;
+                match res {
+                    Ok(a) => {
+                        let hits = inserted_windows(&a.left_channel, &tx);
+                        if hits == 0 || attempt + 1 == INSERTION_RETRIES {
+                            if hits > 0 {
+                                log::warn!(
+                                    "qa40x: stimulus data inserted in the capture ({hits} windows), kept after {INSERTION_RETRIES} attempts"
+                                );
+                            }
+                            captured = Some((dev, a));
+                            break;
+                        }
+                        log::info!(
+                            "qa40x: stimulus data inserted in the capture ({hits} windows), retrying"
+                        );
+                        self.insertions.fetch_add(1, Ordering::Relaxed);
+                        drop(dev);
+                    }
+                    Err(e) => {
+                        if !self.cancel.load(Ordering::Relaxed) {
+                            log::warn!("qa40x capture failed: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+            let Some((dev, audio)) = captured else { break };
+            prev_left.clone_from(&left);
+            prev_right.clone_from(&right);
             if !self.cfg.capture {
+                drop(dev);
                 continue;
             }
             let n = audio.left_channel.len().min(audio.right_channel.len());
@@ -638,5 +749,37 @@ mod tests {
             .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5)
             .collect();
         assert_eq!(best_lag(&chirp, &noise, LATENCY_MAX_FRAMES), None);
+    }
+}
+
+#[cfg(test)]
+mod insertion_tests {
+    use super::*;
+
+    #[test]
+    fn detects_only_exact_stimulus_copies() {
+        let tx: Vec<f32> = (0..4096)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 1000.0 * i as f32 / 48000.0).sin())
+            .collect();
+        let set = tx_windows(&[&tx]);
+        // A real loopback: same tone, scaled and shifted — no exact windows.
+        let real: Vec<f32> = (0..4096)
+            .map(|i| {
+                0.2371 * (std::f32::consts::TAU * 1000.0 * (i as f32 + 46.3) / 48000.0).sin() + 1e-5
+            })
+            .collect();
+        assert_eq!(inserted_windows(&real, &set), 0);
+        // The DAC round trip: encode to i32 (2^31-1 scale), decode by 2^31 — still exact.
+        let mut corrupted = real.clone();
+        for i in 1000..1128 {
+            let q = (tx[i + 7] * 2_147_483_647.0) as i32;
+            corrupted[i] = q as f32 / 2_147_483_648.0;
+        }
+        assert!(inserted_windows(&corrupted, &set) >= 100);
+        // Real silence is never exactly zero for long; inserted DAC silence is.
+        assert_eq!(inserted_windows(&real, &Default::default()), 0);
+        let mut zeros = real.clone();
+        zeros[500..600].iter_mut().for_each(|v| *v = 0.0);
+        assert_eq!(inserted_windows(&zeros, &Default::default()), 1);
     }
 }

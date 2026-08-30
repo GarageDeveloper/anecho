@@ -60,3 +60,11 @@ required-features = ["qa40x"]
 [[example]]
 name = "qa40x_driver_insertion"
 required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_chunk_profile"
+required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_residual"
+required-features = ["qa40x"]
