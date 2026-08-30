@@ -175,6 +175,7 @@ dependencies = [
  "anecho-client",
  "anecho-contract",
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "reqwest",
  "serde",
