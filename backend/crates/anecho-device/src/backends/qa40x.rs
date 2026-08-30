@@ -590,8 +590,9 @@ impl Worker {
             }
             let n = audio.left_channel.len().min(audio.right_channel.len());
             let start = pad.min(n);
-            let mut out = Vec::with_capacity((n - start) * 2);
-            for i in start..n {
+            let end = (start + chunk).min(n);
+            let mut out = Vec::with_capacity((end - start) * 2);
+            for i in start..end {
                 out.push(if cap_l { audio.left_channel[i] } else { 0.0 });
                 out.push(if cap_r { audio.right_channel[i] } else { 0.0 });
             }

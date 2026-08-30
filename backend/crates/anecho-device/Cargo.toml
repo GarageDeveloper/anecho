@@ -52,3 +52,11 @@ required-features = ["qa40x-sim"]
 [[example]]
 name = "qa40x_thdn_breakdown"
 required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_raw_dump"
+required-features = ["qa40x"]
+
+[[example]]
+name = "qa40x_driver_insertion"
+required-features = ["qa40x"]
