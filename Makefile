@@ -55,6 +55,9 @@ dev: ## Run the Tauri frontend in dev mode (needs the backend crates built)
 testbench: ## A/B bench: compare Anecho with REW (REW must run in API mode on :4735)
 	cargo run -p anecho-testbench -- compare
 
+testbench-thd: ## A/B bench: same sine through a loopback device (BlackHole) — fundamental, RTA peak, THD, THD+N
+	cargo run -p anecho-testbench -- compare-thd
+
 clean:
 	cargo clean
 	rm -rf frontend/src/gen
