@@ -16,17 +16,17 @@
         max="1048576"
         step="64"
         bind:value={app.scope.windowFrames}
-        disabled={app.running}
+       
       />
       frames
     </label>
     <label>
       Points
-      <input type="number" min="16" max="8192" step="16" bind:value={app.scope.points} disabled={app.running} />
+      <input type="number" min="16" max="8192" step="16" bind:value={app.scope.points} />
     </label>
     <label>
       Trigger
-      <select bind:value={app.scope.triggerMode} disabled={app.running}>
+      <select bind:value={app.scope.triggerMode}>
         <option value={ScopeConfig_Trigger_Mode.UNSPECIFIED}>Free run</option>
         <option value={ScopeConfig_Trigger_Mode.RISING}>Rising</option>
         <option value={ScopeConfig_Trigger_Mode.FALLING}>Falling</option>
@@ -37,10 +37,10 @@
         max="1"
         step="0.05"
         bind:value={app.scope.triggerLevel}
-        disabled={app.running}
+       
         title="level (±1)"
       />
-      <select bind:value={app.scope.triggerChannel} disabled={app.running}>
+      <select bind:value={app.scope.triggerChannel}>
         {#each Array.from({ length: channels }, (_, i) => i) as ch (ch)}<option value={ch}>CH {ch + 1}</option>{/each}
       </select>
     </label>

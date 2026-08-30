@@ -27,6 +27,10 @@
     app.rta.averagingMode === RtaConfig_Averaging_Mode.EXPONENTIAL ||
       app.rta.averagingMode === RtaConfig_Averaging_Mode.LINEAR,
   );
+  // Rows shown even before the cursor moves: the stream's channels, else the device's.
+  const cursorChannels = $derived(
+    app.cursor?.values.length ?? app.stream?.channels ?? app.selectedDevice?.inputChannels ?? 2,
+  );
 </script>
 
 <aside class="inspector">
@@ -71,26 +75,34 @@
     {:else}
       <p class="muted">No stream running.</p>
     {/if}
+    {#if app.error}
+      <p class="error">{app.error}</p>
+    {/if}
   </section>
-
-  {#if app.cursor && app.stream && app.stream.kind !== StreamKind.LEVELS}
-    <section>
-      <h2>Cursor</h2>
-      <dl class="mono">
-        <dt>x</dt>
-        <dd>{fmtX(app.cursor.x)}</dd>
-        {#each app.cursor.values as v, i (i)}
-          <dt>CH {i + 1}</dt>
-          <dd>{fmt(v)} {app.tab === "scope" ? "" : app.unit}</dd>
-        {/each}
-      </dl>
-    </section>
-  {/if}
 
   <section>
     <h2>Measure</h2>
     <MeasurePanel />
   </section>
+
+  {#if app.tab !== "levels"}
+    <section>
+      <h2>
+        Cursor
+        {#if app.cursor}
+          <button class="clear" title="clear" onclick={() => app.clearCursor()}>×</button>
+        {/if}
+      </h2>
+      <dl class="mono">
+        <dt>x</dt>
+        <dd>{app.cursor ? fmtX(app.cursor.x) : "—"}</dd>
+        {#each Array.from({ length: cursorChannels }, (_, i) => i) as i (i)}
+          <dt>CH {i + 1}</dt>
+          <dd>{app.cursor ? fmt(app.cursor.values[i] ?? null) : "—"} {app.tab === "scope" ? "" : app.unit}</dd>
+        {/each}
+      </dl>
+    </section>
+  {/if}
 </aside>
 
 <style>
@@ -128,6 +140,26 @@
     color: var(--warn);
   }
   .muted {
+    color: var(--muted);
+  }
+  .error {
+    color: var(--err);
+    font-size: 12px;
+    margin: 8px 0 0;
+    word-break: break-word;
+  }
+  h2 {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .clear {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 11px;
+    line-height: 16px;
     color: var(--muted);
   }
 </style>

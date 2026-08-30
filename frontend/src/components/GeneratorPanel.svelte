@@ -3,7 +3,8 @@
   import { DUAL_TONE_PRESETS, generator as g } from "../lib/generator.svelte";
 
   const outputs = $derived(app.selectedDevice?.outputChannels ?? 0);
-  const locked = $derived(app.running || !g.enabled);
+  // Editable while streaming: the store restarts the stream with the new generator.
+  const locked = $derived(!g.enabled);
 
   function toggleChannel(ch: number) {
     const all = Array.from({ length: outputs }, (_, i) => i);
@@ -23,7 +24,7 @@
 {#if outputs > 0}
   <div class="gen">
     <label class="row">
-      <input type="checkbox" bind:checked={g.enabled} disabled={app.running} />
+      <input type="checkbox" bind:checked={g.enabled} />
       <span>Enable generator</span>
     </label>
 

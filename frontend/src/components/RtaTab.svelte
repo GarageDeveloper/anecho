@@ -15,33 +15,33 @@
   <div class="controls">
     <label>
       FFT
-      <select bind:value={app.rta.fftLength} disabled={app.running}>
+      <select bind:value={app.rta.fftLength}>
         {#each FFT_LENGTHS as n (n)}<option value={n}>{n / 1024}k</option>{/each}
       </select>
     </label>
     <label>
       Window
-      <select bind:value={app.rta.window} disabled={app.running}>
+      <select bind:value={app.rta.window}>
         {#each WINDOWS as w (w.value)}<option value={w.value}>{w.label}</option>{/each}
       </select>
     </label>
     <label>
       Averaging
-      <select bind:value={app.rta.averagingMode} disabled={app.running}>
+      <select bind:value={app.rta.averagingMode}>
         {#each AVERAGING_MODES as m (m.value)}<option value={m.value}>{m.label}</option>{/each}
       </select>
       {#if counted}
-        <input type="number" min="2" max="256" bind:value={app.rta.averagingCount} disabled={app.running} />
+        <input type="number" min="2" max="256" bind:value={app.rta.averagingCount} />
       {/if}
     </label>
     <label>
       Display
-      <select bind:value={app.rta.display} disabled={app.running}>
+      <select bind:value={app.rta.display}>
         <option value="log">Log points</option>
         <option value="octave">Octave bands</option>
       </select>
       {#if octave}
-        <select bind:value={app.rta.octaveFraction} disabled={app.running}>
+        <select bind:value={app.rta.octaveFraction}>
           {#each OCTAVE_FRACTIONS as f (f)}<option value={f}>1/{f}</option>{/each}
         </select>
       {:else}
@@ -51,21 +51,21 @@
           max="8192"
           step="50"
           bind:value={app.rta.points}
-          disabled={app.running}
+         
           title="points"
         />
       {/if}
     </label>
     <label>
       Range
-      <input type="number" min="1" bind:value={app.rta.minHz} disabled={app.running} title="min Hz" />
+      <input type="number" min="1" bind:value={app.rta.minHz} title="min Hz" />
       –
-      <input type="number" min="10" bind:value={app.rta.maxHz} disabled={app.running} title="max Hz" />
+      <input type="number" min="10" bind:value={app.rta.maxHz} title="max Hz" />
       Hz
     </label>
     <label>
       Rate
-      <input type="number" min="1" max="60" bind:value={app.rta.updateRateHz} disabled={app.running} />
+      <input type="number" min="1" max="60" bind:value={app.rta.updateRateHz} />
       Hz
     </label>
   </div>

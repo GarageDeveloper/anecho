@@ -16,6 +16,17 @@
     { id: "scope", label: "Scope" },
   ];
 
+  // Any RTA/scope control or generator edit while streaming restarts the stream
+  // (debounced in the store); the tab switch has its own path in selectTab.
+  let lastSig = app.streamSignature;
+  $effect(() => {
+    const sig = app.streamSignature;
+    if (sig !== lastSig) {
+      lastSig = sig;
+      app.scheduleRestart();
+    }
+  });
+
   onMount(() => {
     // The desktop shell starts the backend before the webview loads; retry briefly anyway.
     let attempts = 0;
@@ -46,9 +57,9 @@
     </section>
     <section>
       <h2>4 · Capture</h2>
-      {#if app.running}
+      {#if app.running || app.restarting}
         <button onclick={() => app.stop()}>Stop</button>
-        <div class="state ok">streaming {app.tab}</div>
+        <div class="state ok">{app.restarting ? "restarting…" : `streaming ${app.tab}`}</div>
       {:else}
         <button
           class="primary"

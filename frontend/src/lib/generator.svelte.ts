@@ -42,6 +42,26 @@ export class GeneratorState {
       .filter((f) => Number.isFinite(f) && f > 0);
   }
 
+  /** Everything that changes the contract message, as one string (restart trigger). */
+  get signature(): string {
+    return JSON.stringify([
+      this.enabled,
+      this.kind,
+      this.sineHz,
+      this.dual,
+      this.multitone,
+      this.schroeder,
+      this.noiseKind,
+      this.periodic,
+      this.periodFrames,
+      this.squareHz,
+      this.levelUnit,
+      this.levelDbfs,
+      this.levelDbv,
+      this.outputChannels,
+    ]);
+  }
+
   /** A short description for the inspector / status bar. */
   get summary(): string {
     if (!this.enabled) return "off";

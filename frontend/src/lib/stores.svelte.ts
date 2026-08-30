@@ -114,11 +114,14 @@ class AppState {
   overruns = $state(0);
   rangeChanges = $state(0);
   cursor = $state<CursorReadout | null>(null);
+  /** True while a running stream is stopped and started again after a control change. */
+  restarting = $state(false);
   rta = new RtaSettings();
   scope = new ScopeSettings();
   measure = new MeasureSettings();
 
   private client: Client | null = null;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
 
   get selectedDevice(): DeviceInfo | undefined {
     return this.devices.find((d) => d.id === this.selectedDeviceId);
@@ -206,6 +209,54 @@ class AppState {
     if (wasRunning) await this.startStream();
   }
 
+  /**
+   * A stream parameter (RTA/scope controls, generator) changed while streaming: restart
+   * the stream with the new request, debounced so typing a number does not spam the
+   * backend. Session settings (sample rate, ranges) still need an explicit stop.
+   */
+  scheduleRestart() {
+    if (!this.running && !this.restarting) return;
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restarting = true;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.restartNow();
+    }, 250);
+  }
+
+  private async restartNow() {
+    try {
+      await this.stopStream();
+      await this.startStream();
+    } finally {
+      this.restarting = false;
+    }
+  }
+
+  /** Every request parameter as one string; the tabs watch it to trigger restarts. */
+  get streamSignature(): string {
+    const r = this.rta;
+    const sc = this.scope;
+    return JSON.stringify([
+      r.fftLength,
+      r.window,
+      r.averagingMode,
+      r.averagingCount,
+      r.display,
+      r.points,
+      r.octaveFraction,
+      r.minHz,
+      r.maxHz,
+      r.updateRateHz,
+      sc.windowFrames,
+      sc.points,
+      sc.triggerMode,
+      sc.triggerLevel,
+      sc.triggerChannel,
+      generator.signature,
+    ]);
+  }
+
   private async ensureSession(): Promise<bigint | null> {
     const c = this.client;
     const d = this.selectedDevice;
@@ -271,6 +322,7 @@ class AppState {
             : undefined,
       });
       const stream = await c.startStream(req);
+      this.error = "";
       this.stream = stream;
       this.unit = stream.scale?.unit.case === "dbvOffset" ? "dBV" : "dBFS";
       this.levels = Array.from({ length: stream.channels }, () => ({ rms: -200, peak: -200 }));
@@ -334,6 +386,7 @@ class AppState {
         maxHarmonic: this.measure.maxHarmonic,
       });
       this.measure.result = await c.measure(req);
+      this.error = "";
       this.unit = this.measure.result.scale?.unit.case === "dbvOffset" ? "dBV" : "dBFS";
     } catch (e) {
       this.error = describe(e);
@@ -347,6 +400,9 @@ class AppState {
     this.levels = [];
     this.rtaData = null;
     this.scopeData = null;
+  }
+
+  clearCursor() {
     this.cursor = null;
   }
 
