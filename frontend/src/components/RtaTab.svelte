@@ -80,6 +80,8 @@
         xLabel="Hz"
         yLabel={app.unit}
         {yRange}
+        hidden={app.rta.hidden}
+        onToggleChannel={(i) => (app.rta.hidden[i] = !app.rta.hidden[i])}
         onCursor={(c) => (app.cursor = c)}
       />
     {:else}

@@ -6,6 +6,7 @@
   import { onMount } from "svelte";
   import type { CursorReadout } from "../lib/stores.svelte";
   import { channelBars, nearestSlot, slotWidth } from "../lib/bars";
+  import { hzLabel, logAxisPlan, type LogAxisPlan } from "../lib/axis";
 
   interface Props {
     axis: number[];
@@ -17,6 +18,9 @@
     yRange?: [number, number];
     bars?: boolean;
     seriesNames?: string[];
+    /** Hidden state per channel, owned by the tab so it survives tab switches. */
+    hidden?: boolean[];
+    onToggleChannel?: (i: number) => void;
     onCursor?: (c: CursorReadout | null) => void;
   }
 
@@ -30,31 +34,26 @@
     yRange = [-120, 20],
     bars = false,
     seriesNames = [],
+    hidden = [],
+    onToggleChannel,
     onCursor,
   }: Props = $props();
 
   const COLORS = ["#4fa3ff", "#f5b942", "#3ccf7a", "#ff5c5c", "#c58cff", "#5ee0e6"];
 
-  /** Compact frequency label: 20, 315, 1k, 1.25k, 12.5k. */
-  function hzLabel(v: number): string {
-    if (v >= 1000) {
-      const k = v / 1000;
-      const txt = Number.isInteger(k) ? `${k}` : k.toFixed(2).replace(/\.?0+$/, "");
-      return `${txt}k`;
+  // Cached plan of the log axis (splits, labels, decades) for the current range/width.
+  let plan: LogAxisPlan = { splits: [], labels: [], decades: [] };
+  let planKey = "";
+  function currentPlan(u: uPlot): LogAxisPlan {
+    const min = u.scales.x.min ?? 1;
+    const max = u.scales.x.max ?? 10;
+    const width = u.bbox.width / (window.devicePixelRatio || 1);
+    const key = `${min}|${max}|${Math.round(width)}`;
+    if (key !== planKey) {
+      plan = logAxisPlan(min, max, width);
+      planKey = key;
     }
-    return Number.isInteger(v) ? `${v}` : v.toFixed(1).replace(/\.0$/, "");
-  }
-
-  /** Decades and their 2·/5· multiples: 20, 50, 100, 200, 500, 1k, 2k, 5k, 10k, 20k... */
-  function isLogMajor(v: number): boolean {
-    if (v <= 0) return false;
-    const m = v / Math.pow(10, Math.floor(Math.log10(v) + 1e-9));
-    return [1, 2, 5].some((k) => Math.abs(m - k) < 1e-6);
-  }
-
-  /** Labels for the log axis: named majors only, "" elsewhere (uPlot would print null). */
-  function logAxisValues(_u: uPlot, vals: number[]): string[] {
-    return vals.map((v) => (isLogMajor(v) ? hzLabel(v) : ""));
+    return plan;
   }
 
   /** Labels for octave bands: one per band centre, thinned when they would overlap. */
@@ -118,6 +117,7 @@
         label: seriesNames[i] ?? `CH ${i + 1}`,
         stroke: color,
         width: 1,
+        show: !hidden[i],
         points: { show: false },
         paths: bars ? (u, sidx) => groupedBars(u, sidx) : undefined,
         fill: bars ? color + "88" : undefined,
@@ -141,8 +141,8 @@
           stroke: "#8b929c",
           grid: { stroke: "#2e333b", width: 1 },
           ticks: { stroke: "#2e333b" },
-          values: bars ? bandAxisValues : xLog ? logAxisValues : undefined,
-          splits: bars ? (u) => u.data[0] as number[] : undefined,
+          values: bars ? bandAxisValues : xLog ? (u: uPlot) => currentPlan(u).labels : undefined,
+          splits: bars ? (u) => u.data[0] as number[] : xLog ? (u: uPlot) => currentPlan(u).splits : undefined,
         },
         {
           label: yLabel,
@@ -151,6 +151,20 @@
           ticks: { stroke: "#2e333b" },
           size: 60,
         },
+        // Log mode only: a second X axis carrying no labels, just stronger decade lines.
+        ...(xLog && !bars
+          ? ([
+              {
+                scale: "x",
+                size: 0,
+                labelSize: 0,
+                ticks: { show: false },
+                grid: { stroke: "#3d444f", width: 1 },
+                splits: (u: uPlot) => currentPlan(u).decades,
+                values: (u: uPlot) => currentPlan(u).decades.map(() => ""),
+              },
+            ] as uPlot.Axis[])
+          : []),
       ],
       hooks: {
         setCursor: [
@@ -195,6 +209,15 @@
     };
   });
 
+  // Visibility toggles never rebuild the chart.
+  $effect(() => {
+    if (!plot) return;
+    for (let i = 0; i < series.length; i++) {
+      const show = !hidden[i];
+      if (plot.series[i + 1] && plot.series[i + 1].show !== show) plot.setSeries(i + 1, { show });
+    }
+  });
+
   // Rebuild when the structure changes (axis, series count, mode); otherwise just push data.
   $effect(() => {
     void axis;
@@ -211,9 +234,65 @@
   });
 </script>
 
-<div class="graph" bind:this={host}></div>
+<div class="wrap">
+  {#if series.length > 1}
+    <div class="legend">
+      {#each series as _s, i (i)}
+        <button
+          type="button"
+          class="entry"
+          class:off={hidden[i]}
+          onclick={() => onToggleChannel?.(i)}
+          title={hidden[i] ? "show" : "hide"}
+        >
+          <span class="swatch" style="background: {COLORS[i % COLORS.length]}"></span>
+          {seriesNames[i] ?? `CH ${i + 1}`}
+        </button>
+      {/each}
+    </div>
+  {/if}
+  <div class="graph" bind:this={host}></div>
+</div>
 
 <style>
+  .wrap {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+  .legend {
+    position: absolute;
+    top: 2px;
+    right: 8px;
+    z-index: 2;
+    display: flex;
+    gap: 8px;
+  }
+  .entry {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    font-size: 11px;
+    font-family: inherit;
+    color: var(--fg, #d6dae1);
+    background: rgba(20, 23, 28, 0.75);
+    border: 1px solid #2e333b;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .entry.off {
+    opacity: 0.45;
+  }
+  .entry.off .swatch {
+    background: transparent !important;
+    box-shadow: inset 0 0 0 1px #555;
+  }
+  .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+  }
   .graph {
     width: 100%;
     height: 100%;

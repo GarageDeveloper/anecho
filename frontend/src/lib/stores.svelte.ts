@@ -76,6 +76,8 @@ class RtaSettings {
   minHz = $state(20);
   maxHz = $state(20000);
   updateRateHz = $state(20);
+  /** Channels hidden in the plot (display only — not part of the stream signature). */
+  hidden = $state<boolean[]>([]);
 }
 
 class ScopeSettings {
@@ -84,6 +86,8 @@ class ScopeSettings {
   triggerMode = $state<ScopeConfig_Trigger_Mode>(ScopeConfig_Trigger_Mode.RISING);
   triggerLevel = $state(0);
   triggerChannel = $state(0);
+  /** Channels hidden in the plot (display only — not part of the stream signature). */
+  hidden = $state<boolean[]>([]);
 }
 
 /**

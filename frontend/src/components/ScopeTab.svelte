@@ -54,6 +54,8 @@
         xLabel="s"
         yLabel="full scale"
         yRange={[-1.05, 1.05]}
+        hidden={app.scope.hidden}
+        onToggleChannel={(i) => (app.scope.hidden[i] = !app.scope.hidden[i])}
         onCursor={(c) => (app.cursor = c)}
       />
     {:else}
